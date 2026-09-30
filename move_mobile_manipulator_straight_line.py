@@ -8,14 +8,15 @@ while the mecanum base drives underneath it.
 Run assemble_mobile_manipulator.py first (once) and save the scene, then
 run this script whenever you want to replay the straight-line drive.
 
-Why UR5's base pose is re-asserted every tick: even though UR5 is
-reparented under youBot and marked kinematic, testing found it still
-drifts away from its mounted offset by tens of cm the instant the
-simulation starts (independent of collisions or joint pose -- looks like
-CoppeliaSim resetting it to a stale cached dynamics pose). Rather than
-depend on native parent/kinematic tracking, this script explicitly
-re-pins UR5's local pose relative to youBot every control tick, which
-reliably keeps it welded in place regardless of that underlying quirk.
+Why UR5's base pose is re-asserted every tick: the YouBot's own factory
+child script (previously) crashed on startup because it looked up the
+YouBot's original arm joints, which assemble_mobile_manipulator.py deletes
+to make room for the UR5. That crash was destabilizing the whole
+simulation (it's been neutralized -- see assemble_mobile_manipulator.py),
+but even with it fixed, UR5 is still just plain-parented to youBot rather
+than physically constrained to it, so this script re-pins UR5's local
+pose relative to youBot every control tick as a robust belt-and-suspenders
+attachment rather than depending on native parent/kinematic tracking alone.
 """
 
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
@@ -38,13 +39,6 @@ ROLLER_ANGLE_DEG = 45.0
 UR5_MOUNT_POSITION = [0.0, 0.0, 0.3]      # local to youBot -- must match assemble_mobile_manipulator.py's MOUNT_HEIGHT
 UR5_MOUNT_ORIENTATION = [0.0, 0.0, 0.0]   # local to youBot -- must match assemble_mobile_manipulator.py's MOUNT_ORIENTATION
 
-WHEEL_SIGN = {
-    "front_left": 1,
-    "front_right": 1,
-    "back_left": 1,
-    "back_right": 1,
-}
-
 UR5_HOME_POSE = [
     0.0,
     -math.pi / 2,
@@ -54,7 +48,7 @@ UR5_HOME_POSE = [
     0.0,
 ]
 
-GOAL = (5.0, 0.0)
+GOAL = (2.0, 0.0)   # the default scene's Floor is only 5x5m (+-2.5m) -- keep the goal inside that, with margin
 SPEED = 0.3
 POSITION_TOLERANCE = 0.05
 CONTROL_DT = 0.05
@@ -123,9 +117,52 @@ for role, candidate_names in WHEEL_JOINT_NAMES.items():
 if missing_roles:
     raise RuntimeError(f"Could not find wheel joints for: {missing_roles}. Check WHEEL_JOINT_NAMES.")
 
-wheel_order = ["front_left", "front_right", "back_left", "back_right"]
-wheels = [wheel_joints[role] for role in wheel_order]
-signs = [WHEEL_SIGN[role] for role in wheel_order]
+def apply_wheel_commands(sim, wheel_joints, u):
+    """
+    Applies assignment4.Mecanum.inverse()'s output [psi_fl, psi_fr, psi_bl,
+    psi_br] to this vehicle's actual joints.
+
+    This isn't a straight passthrough: this YouBot's physical mecanum
+    roller layout is left/right-mirrored relative to what assignment4's
+    formulas assume, and its joints spin backwards relative to
+    assignment4's "positive = forward" convention. Both were confirmed
+    empirically (a pure-forward command only drove the chassis correctly
+    once cross-wired and negated like this) and cross-checked against the
+    YouBot's own factory-authored driving script, which uses the same
+    negation. See assemble_mobile_manipulator.py's git history / PR notes
+    for the derivation.
+    """
+    psi_fl, psi_fr, psi_bl, psi_br = u
+    sim.setJointTargetVelocity(wheel_joints["front_left"], -psi_fr)
+    sim.setJointTargetVelocity(wheel_joints["front_right"], -psi_fl)
+    sim.setJointTargetVelocity(wheel_joints["back_left"], -psi_br)
+    sim.setJointTargetVelocity(wheel_joints["back_right"], -psi_bl)
+
+
+def world_velocity_to_wheels(mecanum, x_state, v_world):
+    """
+    Converts a world-frame desired velocity into wheel rates via
+    assignment4.Mecanum.inverse(), correcting a handedness mismatch found
+    by testing: assignment4's world-to-body rotation, followed by its own
+    wheel formula, reproducibly drove the chassis in the wrong direction
+    whenever the desired velocity had a lateral (world-Y-relative-to-body)
+    component -- confirmed by directly commanding pure +X and +Y world
+    velocities at a known heading and checking the actual resulting
+    motion. Forward-only commands were unaffected; only the lateral
+    (Vy_body) component needed an independent sign flip.
+
+    Rather than edit assignment4.py, this replicates just the rotation
+    step externally, flips Vy_body, and feeds the corrected body-frame
+    velocity into Mecanum.inverse() with theta=0 (a passthrough, since at
+    theta=0 its own rotation is the identity) so its actual wheel-speed
+    formula -- the real content of that assignment -- still does the work.
+    """
+    x, y, theta = x_state
+    vx_w, vy_w, w = v_world
+    c, s = math.cos(theta), math.sin(theta)
+    vx_body = c * vx_w + s * vy_w
+    vy_body = -(-s * vx_w + c * vy_w)  # negated vs. assignment4's own formula -- see docstring
+    return mecanum.inverse([x, y, 0.0], [vx_body, vy_body, w])
 
 # The bundled UR5 model aliases every joint just "joint" (not
 # "UR5_joint1".."UR5_joint6"), so they can't be told apart by name.
@@ -203,7 +240,7 @@ def weld_ur5(sim, ur5_base, youbot_base):
     sim.setObjectOrientation(ur5_base, youbot_base, UR5_MOUNT_ORIENTATION)
 
 
-def drive_to(sim, mecanum, robot_ref, wheels, signs, goal_xy, speed,
+def drive_to(sim, mecanum, robot_ref, wheel_joints, goal_xy, speed,
              ur5_base, youbot_base,
              tolerance=0.05, dt=0.05, max_time=60.0):
     start_time = time.time()
@@ -224,15 +261,14 @@ def drive_to(sim, mecanum, robot_ref, wheels, signs, goal_xy, speed,
         v_desired = [speed * direction[0], speed * direction[1], 0.0]
         x_state = [pos[0], pos[1], theta]
 
-        u = mecanum.inverse(x_state, v_desired)
-        for wheel, psi, sign in zip(wheels, u, signs):
-            sim.setJointTargetVelocity(wheel, sign * psi)
+        u = world_velocity_to_wheels(mecanum, x_state, v_desired)
+        apply_wheel_commands(sim, wheel_joints, u)
 
         time.sleep(dt)
     else:
         print("  (timed out before reaching the goal)")
 
-    for wheel in wheels:
+    for wheel in wheel_joints.values():
         sim.setJointTargetVelocity(wheel, 0.0)
 
 
@@ -255,7 +291,7 @@ def main():
     print(f"Start position: {[round(v, 3) for v in start_pos]}")
     print(f"Driving straight to {GOAL}...")
 
-    drive_to(sim, mecanum, robot_ref, wheels, signs, GOAL, SPEED,
+    drive_to(sim, mecanum, robot_ref, wheel_joints, GOAL, SPEED,
              ur5_base, youbot_base,
              tolerance=POSITION_TOLERANCE, dt=CONTROL_DT, max_time=MAX_TIME)
 
