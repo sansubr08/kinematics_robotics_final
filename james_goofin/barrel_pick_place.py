@@ -101,6 +101,7 @@ FLOOR_CLEARANCE  = 0.01    # m, barrel is released this far above the floor
 MOVE_STEPS       = 120     # sim steps for a normal arm move
 ROTATE_STEPS     = 160     # sim steps for the sideways rotation
 SETTLE_STEPS     = 100     # sim steps after release to let the barrel settle
+SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actually arrive (it lags the IK target)
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
@@ -440,7 +441,19 @@ class Robot:
         code = res[0] if isinstance(res, (tuple, list)) else res
         return code == self.simIK.result_success
 
-    def move_tool(self, target_pose, steps=MOVE_STEPS, settle=40):
+    def _hold_until_reached(self, target_pose, tol=0.01, max_steps=SETTLE_MAX_STEPS):
+        """Keep the IK target on target_pose until the real tool point is within tol of it (the arm lags behind)."""
+        good, err = 0, float("inf")
+        for _ in range(max_steps):
+            self._ik_to(list(target_pose))
+            self.step()
+            err = vnorm(vsub(self.pos(self.grab_ur5), target_pose[:3]))
+            good = good + 1 if err < tol else 0
+            if good >= 5:
+                break
+        return err
+
+    def move_tool(self, target_pose, steps=MOVE_STEPS, settle=SETTLE_MAX_STEPS):
         """Stream GrabPoint_UR5 from where it is to target_pose (straight line + slerp), one IK solve per sim step."""
         start = self.pose(self.grab_ur5)
         p0, q0, p1, q1 = start[:3], start[3:], target_pose[:3], target_pose[3:]
@@ -451,10 +464,7 @@ class Robot:
             if not self._ik_to(pos + slerp(q0, q1, t)):
                 misses += 1
             self.step()
-        for _ in range(settle):                 # hold the final target so the arm catches up
-            self._ik_to(list(target_pose))
-            self.step()
-        err = vnorm(vsub(self.pos(self.grab_ur5), p1))
+        err = self._hold_until_reached(target_pose, max_steps=settle)        # wait for the arm to catch up
         if misses > steps * 0.3 or err > 0.03:
             print(f"  warning: IK trouble (unsolved {misses}/{steps} ticks, final tool error {err * 1000:.0f} mm). "
                   f"Target may be out of reach: try a different --standoff.")
@@ -676,7 +686,7 @@ class Robot:
             print(f"  raising the barrel {need * 100:.0f} cm to clear the surface it will be swung over...")
             self.move_tool([p[0], p[1], p[2] + need] + p[3:])
 
-    def swing_to(self, target_xy, steps=MOVE_STEPS, settle=40):
+    def swing_to(self, target_xy, steps=ROTATE_STEPS, settle=SETTLE_MAX_STEPS):
         """
         Swing the held barrel around the UR5's base axis (same radius, same height) until it sits on the
         line from the arm base to target_xy. Used at PointB so the arm can reach it from any side.
@@ -701,10 +711,12 @@ class Robot:
             if not self._ik_to(last):
                 misses += 1
             self.step()
-        for _ in range(settle):
-            self._ik_to(last)
-            self.step()
-        err = vnorm(vsub(self.pos(self.grab_ur5), last[:3]))
+        err = self._hold_until_reached(last, max_steps=settle)
+        base = self.pos(self.ur5)[:2]
+        now = vsub(self.pos(self.barrel)[:2], base)
+        want = vsub(target_xy, base)
+        off = math.degrees(abs(wrap_angle(math.atan2(want[1], want[0]) - math.atan2(now[1], now[0]))))
+        print(f"  barrel now faces the drop spot to within {off:.0f} deg")
         if misses > steps * 0.3 or err > 0.03:
             print(f"  warning: IK trouble during the swing (unsolved {misses}/{steps}, final tool error "
                   f"{err * 1000:.0f} mm). Try a different --standoff.")
@@ -935,12 +947,21 @@ def run_full(robot):
         print(f"  Stage 3 (drive + grab): {'PASS' if ok3 else 'FAIL'}")
         robot.lift()
 
-        # Park on the side we arrive from, clear of every solid object (the platform never touches the blocks),
-        # as close to PointB as that allows. The arm then reaches over and sets the barrel down ON PointB's surface.
+        # Where the barrel goes: park on the side we arrive from, clear of every solid object (the platform never
+        # touches the blocks), as close to PointB as that allows, and set the barrel down ON the surface at PointB.
         b_xy = robot.pos(robot.point_b)[:2]
         cur_xy = robot.pos(robot.ur5)[:2]
         ur5_goal, _ = robot.park_spot(b_xy, cur_xy, MIN_PARK_DIST)
         place_xy = b_xy
+        surface_z, src = robot.surface_z_at(b_xy, robot.pos(robot.point_b)[2])
+        print(f"  PointB is on {'the top of ' + repr(src) if src else 'the floor'} (surface z = {surface_z:.3f} m)")
+
+        # Turn around NOW, while standing still: lift clear of the white block's height, then swing the arm round so
+        # the barrel points at PointB. The drive then happens with the barrel already facing the white block.
+        robot.raise_clear(surface_z)
+        print("  turning the barrel around to face PointB before driving...")
+        robot.swing_to(b_xy)
+
         print(f"  driving to PointB ({b_xy[0]:.2f}, {b_xy[1]:.2f}) with the barrel...")
         miss = robot.drive_to(ur5_goal)
         print(f"  parked {miss * 1000:.0f} mm from the goal")
@@ -951,10 +972,9 @@ def run_full(robot):
             place_xy = vadd(base_xy, vscale(vunit(to_b), PLACE_REACH_MAX))
             print(f"  PointB is {vnorm(to_b):.2f} m from the arm base; placing at {PLACE_REACH_MAX:.2f} m instead "
                   f"(still on the block as long as it is big enough).")
-        surface_z, src = robot.surface_z_at(place_xy, robot.pos(robot.point_b)[2])
-        print(f"  placing on {'the top of ' + repr(src) if src else 'the floor'} (surface z = {surface_z:.3f} m)")
+        surface_z, src = robot.surface_z_at(place_xy, surface_z)
         robot.raise_clear(surface_z)
-        robot.swing_to(place_xy)
+        robot.swing_to(place_xy)                                                 # fine alignment, usually ~0 deg
 
         ok_side = robot.rotate_sideways()
         final, elev, bottom = robot.lower_and_release(place_xy, surface_z)
