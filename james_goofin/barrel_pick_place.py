@@ -66,8 +66,9 @@ PATH_WHEELS      = [                 # same order as omni_test_move.py
 # --- omni driving ---
 WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from the OmniPlatform lua script
 WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
-CAL_SCALE        = 1.0                # calibration burst speed, as a multiple of WHEEL_V
-CAL_STEPS        = 30                 # sim steps per calibration burst (one wheel at a time)
+CAL_SCALE        = 0.7                # calibration burst speed, as a multiple of WHEEL_V
+CAL_STEPS        = 24                 # sim steps per calibration burst (one wheel at a time, forward then back)
+CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
 CAL_SETTLE_STEPS = 40                 # sim steps to let the platform coast to a stop between bursts
 DRIVE_GAIN       = 2.0                # 1/s, P gain on position error
 DRIVE_MAX_SPEED  = 0.25               # m/s
@@ -246,6 +247,8 @@ class Robot:
         self.sim    = self.client.require("sim")
         self.simIK  = self.client.require("simIK")
         self.ik_env = self.ik_group = self.ik_target = None
+        self.A = None                      # wheel response matrix, filled in once by calibrate_once()
+        self.floor_box = None
         self._resolve()
 
     # ---------- finding things ----------
@@ -382,6 +385,7 @@ class Robot:
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_static, 1)
         self.step(30)
         self._build_ik()
+        self.heading0 = self.platform_yaw()      # heading to hold while driving
 
     def end_run(self):
         try:
@@ -561,8 +565,11 @@ class Robot:
             if norm_name(alias) in ignore:
                 continue
             lo, hi = self._world_aabb(h, self._local_bbox(h))
-            if hi[2] < FLOOR_TOP_Z:
-                continue                                                  # that's the floor
+            if hi[2] < FLOOR_TOP_Z:                                       # that's the floor
+                area = (hi[0] - lo[0]) * (hi[1] - lo[1])
+                if self.floor_box is None or area > self.floor_box[2]:
+                    self.floor_box = (lo, hi, area)
+                continue
             self.bump_obstacles.append((alias, lo, hi))
         self.bump_baseline = {}
 
@@ -604,6 +611,16 @@ class Robot:
             if gap < BUMP_MARGIN and gap < base - 0.003:
                 hit = name
         return hit
+
+    def nearest_obstacle(self):
+        """(name, gap in m) of the obstacle closest to the platform body right now."""
+        lo, hi = self.body_box()
+        best = (None, float("inf"))
+        for name, olo, ohi in self.bump_obstacles:
+            gap = self._gap_box(lo, hi, olo, ohi)
+            if gap < best[1]:
+                best = (name, gap)
+        return best
 
     def park_spot(self, target_xy, from_xy, min_d):
         """
@@ -685,20 +702,18 @@ class Robot:
         for w, c in zip(self.wheels, cmd):
             self.sim.setJointTargetVelocity(w, c)
 
-    def _wheel_burst(self, i):
-        """
-        Spin ONLY wheel i, measure what the platform does. Returns the response in the platform's own
-        frame: [forward-ish m/s, sideways-ish m/s, yaw rate rad/s] per rad/s of that wheel.
-        (Nothing is assumed about which wheel does what, or which way the signs go.)
-        """
+    def _burst_once(self, i, sign):
+        """Spin ONLY wheel i (forward if sign=+1, backward if -1) and measure the response per rad/s, in the
+        platform's own frame: [forward-ish m/s, sideways-ish m/s, yaw rate rad/s]."""
         sim = self.sim
         dt = sim.getSimulationTimeStep()
+        speed = sign * WHEEL_V * CAL_SCALE
         cmd = [0.0] * 4
-        cmd[i] = WHEEL_V * CAL_SCALE
+        cmd[i] = speed
         self._set_wheels(cmd)
         half = CAL_STEPS // 2
         self.step(half)                                       # let the wheel spin up, discard this part
-        if i == 0:
+        if i == 0 and sign > 0:
             try:                                              # is something else fighting our wheel command?
                 got = sim.getJointTargetVelocity(self.wheels[0])
                 if abs(got - cmd[0]) > 1e-3:
@@ -716,25 +731,100 @@ class Robot:
         v_world = vscale(vsub(p1, p0), 1.0 / t)
         v_body = rot2(v_world, -(y0 + wrap_angle(y1 - y0) / 2.0))        # world -> platform frame
         w = wrap_angle(y1 - y0) / t
-        k = 1.0 / (WHEEL_V * CAL_SCALE)
-        return [v_body[0] * k, v_body[1] * k, w * k]
+        return [v_body[0] / speed, v_body[1] / speed, w / speed]
 
-    def calibrate_omni(self):
-        print("  calibrating wheels (one wheel at a time, short bursts)...")
-        self.heading0 = self.platform_yaw()            # the heading we will hold while driving
-        cols = [self._wheel_burst(i) for i in range(4)]
-        self.A = [[cols[k][r] for k in range(4)] for r in range(3)]       # 3 x 4: body (vx, vy, yaw) per wheel
+    def _wheel_burst(self, i):
+        """Forward burst then backward burst: the platform ends up about where it began, and the two are averaged."""
+        a = self._burst_once(i, +1)
+        b = self._burst_once(i, -1)
+        return [(a[k] + b[k]) / 2.0 for k in range(3)]
+
+    def _find_clear_spot(self):
+        """A place for the arm base where the platform body is CAL_CLEAR_M away from every obstacle, on the floor."""
+        lo, hi = self.body_box()
+        base = self.pos(self.ur5)
+        off_lo = [lo[0] - base[0], lo[1] - base[1]]
+        off_hi = [hi[0] - base[0], hi[1] - base[1]]
+        for r in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5):
+            for k in range(1 if r == 0.0 else 16):
+                ang = 2.0 * math.pi * k / 16.0
+                c = [base[0] + r * math.cos(ang), base[1] + r * math.sin(ang)]
+                clo = [c[0] + off_lo[0], c[1] + off_lo[1], lo[2]]
+                chi = [c[0] + off_hi[0], c[1] + off_hi[1], hi[2]]
+                if self._min_gap(clo, chi) < CAL_CLEAR_M:
+                    continue
+                if self.floor_box is not None:
+                    flo, fhi, _ = self.floor_box
+                    if not (flo[0] + 0.3 < clo[0] and chi[0] < fhi[0] - 0.3 and flo[1] + 0.3 < clo[1] and chi[1] < fhi[1] - 0.3):
+                        continue
+                return c
+        return None
+
+    def calibrate_once(self):
+        """
+        Measure how each wheel moves the platform (3 x 4 matrix: forward, sideways, yaw per wheel). This is a
+        property of the platform, not of where it stands, so it is done ONCE, in a clear part of the room, and the
+        platform is put back at its real start afterwards. Each wheel gets a short forward burst and a short
+        backward burst, so the platform barely wanders.
+        """
+        if self.A is not None:
+            return
+        sim = self.sim
+        print("== Calibrating the omni wheels (once) ==")
+        sim.setObjectPose(self.platform, -1, self.platform_start_pose)
+        for j, q in zip(self.joints, self.joint_start):
+            sim.setJointPosition(j, q)
+        spot = self._find_clear_spot()
+        if spot is not None:
+            shift = vsub(spot, self.pos(self.ur5)[:2])
+            p = sim.getObjectPosition(self.platform, -1)
+            sim.setObjectPosition(self.platform, -1, [p[0] + shift[0], p[1] + shift[1], p[2]])
+            print(f"  calibrating at a clear spot ({spot[0]:.2f}, {spot[1]:.2f}); the platform goes back to its start afterwards")
+        else:
+            print("  no clear spot found (nothing {:.1f} m away from every obstacle); calibrating in place with small bursts".format(CAL_CLEAR_M))
+        sim.setStepping(True)
+        sim.startSimulation()
+        try:
+            for j in self.joints:
+                try:
+                    sim.setIntProperty(j, "dynCtrlMode", sim.jointdynctrl_position)
+                except Exception:
+                    pass
+            for j, q in zip(self.joints, self.joint_start):
+                sim.setJointTargetPosition(j, q)
+            self.step(40)
+            cols = [self._wheel_burst(i) for i in range(4)]
+        finally:
+            self._set_wheels([0.0] * 4)
+            sim.stopSimulation(True)
+            sim.setObjectPose(self.platform, -1, self.platform_start_pose)
+            for j, q in zip(self.joints, self.joint_start):
+                sim.setJointPosition(j, q)
+
+        A = [[cols[k][r] for k in range(4)] for r in range(3)]            # 3 x 4: body (vx, vy, yaw) per wheel
         names = ["back right", "front right", "front left", "back left"]
-        print("    response per wheel (rad/s):   body-x m/s | body-y m/s | yaw rad/s")
+        print("  response per wheel (rad/s):   body-x m/s | body-y m/s | yaw rad/s")
         for k in range(4):
-            print(f"      wheel {k} ({names[k]:11s}): {cols[k][0]:+.4f} | {cols[k][1]:+.4f} | {cols[k][2]:+.4f}")
+            print(f"    wheel {k} ({names[k]:11s}): {cols[k][0]:+.4f} | {cols[k][1]:+.4f} | {cols[k][2]:+.4f}")
         if max(abs(x) for c in cols for x in c) < 1e-4:
             raise RuntimeError("No wheel moved the platform. Check the wheel paths and that the wheel joints are "
                                "velocity-controlled and the platform is not fixed/static.")
-        if solve_min_norm(self.A, [1.0, 0.0, 0.0]) is None:
+        if solve_min_norm(A, [1.0, 0.0, 0.0]) is None:
             raise RuntimeError("The four wheels cannot produce all of forward, sideways and turning motion "
                                "(calibration matrix is singular). Paste the response table above to me.")
-        self.step(10)
+        self.A = A
+
+    def scene_summary(self):
+        """What the bump checker and the parking logic believe about the scene (for debugging)."""
+        lo, hi = self.body_box()
+        print("Scene as the script sees it:")
+        print(f"  platform body box  x {lo[0]:+.2f}..{hi[0]:+.2f}  y {lo[1]:+.2f}..{hi[1]:+.2f}  z {lo[2]:+.2f}..{hi[2]:+.2f}")
+        for name, olo, ohi in self.bump_obstacles:
+            gap = self._gap_box(lo, hi, olo, ohi)
+            print(f"  obstacle {name:20s} x {olo[0]:+.2f}..{ohi[0]:+.2f}  y {olo[1]:+.2f}..{ohi[1]:+.2f}  "
+                  f"z {olo[2]:+.2f}..{ohi[2]:+.2f}   gap to platform {gap * 1000:.0f} mm")
+        if not self.bump_obstacles:
+            print("  (no obstacles found: the bump checker and clear-parking have nothing to avoid)")
 
     def drive_to(self, goal_xy, tol=DRIVE_TOL):
         """
@@ -774,7 +864,9 @@ class Robot:
                           f"wheels stopped.")
                     break
             if n % 100 == 0:
-                print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg")
+                near, gap = self.nearest_obstacle()
+                near_txt = f", nearest solid '{near}' {gap * 1000:.0f} mm" if near is not None and gap < 5.0 else ""
+                print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg{near_txt}")
 
             if STOP_ON_CONTACT and (n + 1) % STALL_WINDOW == 0:
                 moved = vsub(self.pos(self.ur5)[:2], anchor)
@@ -813,9 +905,9 @@ def run_ur5_only(robot):
 def run_full(robot):
     """Stages 3-4."""
     print("== Stage 3-4: omni drives to the barrel, grabs, drives to PointB, places it sideways ==")
+    robot.calibrate_once()
     robot.begin_run(near_barrel=False)
     try:
-        robot.calibrate_omni()
 
         barrel_xy = robot.pos(robot.barrel)[:2]
         start_xy  = robot.pos(robot.ur5)[:2]
@@ -881,6 +973,7 @@ def main():
         ARM_STANDOFF = args.standoff
 
     robot = Robot()
+    robot.scene_summary()
     if args.discover:
         robot.discover()
         return 0
