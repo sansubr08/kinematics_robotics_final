@@ -75,6 +75,10 @@ DRIVE_TOL        = 0.02               # m, stop when this close
 DRIVE_MAX_STEPS  = 4000
 YAW_GAIN         = 1.5                # 1/s, P gain on heading error
 YAW_MAX_RATE     = 0.5                # rad/s, cap on the turning command that holds the heading
+STOP_ON_CONTACT  = True               # stop driving when the platform runs into something (e.g. the white block)
+STALL_WINDOW     = 40                 # sim steps; we check progress toward the goal over this window
+STALL_MIN_FRAC   = 0.15               # blocked if progress is less than this fraction of what we commanded
+STALL_MIN_M      = 0.01               # ...and less than this many metres
 
 # --- arm / grasp geometry ---
 ARM_STANDOFF     = 0.55    # m, horizontal distance from UR5 base to the barrel when parked for the grab
@@ -598,7 +602,14 @@ class Robot:
         self.step(10)
 
     def drive_to(self, goal_xy, tol=DRIVE_TOL):
-        """Drive the UR5 base to goal_xy (world xy) with the calibrated wheel model, holding the start heading."""
+        """
+        Drive the UR5 base to goal_xy (world xy) with the calibrated wheel model, holding the start heading.
+        Stops early if the platform runs into something (no progress although we are still commanding motion).
+        Sets self.blocked to say whether that happened.
+        """
+        dt = self.sim.getSimulationTimeStep()
+        self.blocked = False
+        anchor, commanded = self.pos(self.ur5)[:2], 0.0           # progress bookkeeping for contact detection
         for n in range(DRIVE_MAX_STEPS):
             p = self.pos(self.ur5)[:2]
             err = vsub(goal_xy, p)
@@ -617,8 +628,19 @@ class Robot:
                 c = [x * WHEEL_MAX / peak for x in c]
             self._set_wheels(c)
             self.step()
+            commanded += speed * dt
             if n % 100 == 0:
                 print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg")
+
+            if STOP_ON_CONTACT and (n + 1) % STALL_WINDOW == 0:
+                moved = vsub(self.pos(self.ur5)[:2], anchor)
+                toward = vdot(moved, vunit(err))                                  # progress toward the goal
+                if n + 1 > STALL_WINDOW and dist > 2 * tol and toward < max(STALL_MIN_M, STALL_MIN_FRAC * commanded):
+                    self.blocked = True
+                    print(f"  platform is not making progress ({dist * 1000:.0f} mm from the goal): it has run into "
+                          f"something, stopping here.")
+                    break
+                anchor, commanded = self.pos(self.ur5)[:2], 0.0
         else:
             print("  (drive timed out before reaching the goal)")
         self._set_wheels([0.0] * 4)
