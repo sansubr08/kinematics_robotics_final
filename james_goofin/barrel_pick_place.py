@@ -79,6 +79,16 @@ STOP_ON_CONTACT  = True               # stop driving when the platform runs into
 STALL_WINDOW     = 40                 # sim steps; we check progress toward the goal over this window
 STALL_MIN_FRAC   = 0.15               # blocked if progress is less than this fraction of what we commanded
 STALL_MIN_M      = 0.01               # ...and less than this many metres
+BUMP_STOP        = True               # stop the wheels as soon as the platform body touches ANY solid object
+BUMP_MARGIN      = 0.02               # m, "touching" = platform body within this distance of the object
+BUMP_CHECK_EVERY = 2                  # sim steps between bump checks
+FLOOR_TOP_Z      = 0.05               # m, shapes whose top is below this are treated as the floor (not an obstacle)
+BUMP_IGNORE      = []                 # aliases of shapes the bump checker should ignore
+PARK_CLEARANCE   = 0.05               # m, platform body stays at least this far from every obstacle when parked
+PARK_MAX_DIST    = 1.6                # m, how far back from the target we search for a clear parking spot
+MIN_PARK_DIST    = 0.35               # m, closest the arm base is allowed to park to the drop spot
+PLACE_REACH_MAX  = 0.70               # m, farthest horizontal reach asked of the arm when placing
+RAISE_CLEAR      = 0.05               # m, barrel bottom stays this far above a surface it is swung over
 
 # --- arm / grasp geometry ---
 ARM_STANDOFF     = 0.55    # m, horizontal distance from UR5 base to the barrel when parked for the grab
@@ -230,12 +240,11 @@ def standoff_goal(barrel_xy, from_xy, standoff):
 class Robot:
     """Everything that talks to CoppeliaSim lives in here."""
 
-    def __init__(self, platform_at_b=False):
+    def __init__(self):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
         self.sim    = self.client.require("sim")
         self.simIK  = self.client.require("simIK")
-        self.platform_at_b = platform_at_b
         self.ik_env = self.ik_group = self.ik_target = None
         self._resolve()
 
@@ -295,6 +304,7 @@ class Robot:
         self.barrel_static0      = sim.getObjectInt32Param(self.barrel, sim.shapeintparam_static)
         self.barrel_respond0     = sim.getObjectInt32Param(self.barrel, sim.shapeintparam_respondable)
         self.floor_z             = self.world_min_z(self.barrel)
+        self._build_bump_monitor()
 
     def discover(self):
         sim = self.sim
@@ -354,7 +364,7 @@ class Robot:
         for j, q in zip(self.joints, self.joint_start):
             sim.setJointPosition(j, q)
         if near_barrel:
-            goal = standoff_goal(self.pos(self.barrel)[:2], self.pos(self.ur5)[:2], ARM_STANDOFF)
+            goal, _ = self.park_spot(self.pos(self.barrel)[:2], self.pos(self.ur5)[:2], ARM_STANDOFF)
             shift = vsub(goal, self.pos(self.ur5)[:2])
             p = sim.getObjectPosition(self.platform, -1)
             sim.setObjectPosition(self.platform, -1, [p[0] + shift[0], p[1] + shift[1], p[2]])
@@ -498,19 +508,144 @@ class Robot:
         print(f"  barrel axis now {after:.1f} deg from horizontal")
         return after < SIDEWAYS_TOL_DEG
 
-    def lower_and_release(self, target_xy):
-        """Stage 4 end: put the sideways barrel over target_xy, lower to the floor, let go."""
+    def lower_and_release(self, target_xy, surface_z):
+        """Stage 4 end: put the sideways barrel over target_xy, lower it onto the surface at surface_z, let go."""
         center = self.pos(self.barrel)
         tool = self.pose(self.grab_ur5)
         dx = target_xy[0] - center[0]
         dy = target_xy[1] - center[1]
         self.move_tool([tool[0] + dx, tool[1] + dy, tool[2]] + tool[3:])                   # slide over the spot
-        dz = (self.floor_z + FLOOR_CLEARANCE) - self.world_min_z(self.barrel)
+        dz = (surface_z + FLOOR_CLEARANCE) - self.world_min_z(self.barrel)
         tool = self.pose(self.grab_ur5)
         self.move_tool([tool[0], tool[1], tool[2] + dz] + tool[3:])                        # lower
         self.release_barrel()
         final = self.pos(self.barrel)
-        return final, axis_elevation_deg(self.barrel_axis_world())
+        return final, axis_elevation_deg(self.barrel_axis_world()), self.world_min_z(self.barrel)
+
+    # ---------- bump checker ----------
+    def _world_aabb(self, obj, bb):
+        """Axis-aligned world box (lo, hi) around an object's local bounding box bb."""
+        pose = self.sim.getObjectPose(obj, -1)
+        lo, hi = [1e9] * 3, [-1e9] * 3
+        for x in (bb[0], bb[3]):
+            for y in (bb[1], bb[4]):
+                for z in (bb[2], bb[5]):
+                    w = vadd(pose[:3], quat_rotate(pose[3:], [x, y, z]))
+                    lo = [min(lo[i], w[i]) for i in range(3)]
+                    hi = [max(hi[i], w[i]) for i in range(3)]
+        return lo, hi
+
+    def _build_bump_monitor(self):
+        """Work out which shapes are the platform body and which are obstacles (everything else except the floor)."""
+        sim = self.sim
+        shape = sim.object_shape_type
+        ur5_tree = set(sim.getObjectsInTree(self.ur5, shape, 0))
+        plat_tree = set(sim.getObjectsInTree(self.platform, shape, 0))
+        for root, tree in ((self.ur5, ur5_tree), (self.platform, plat_tree)):
+            if sim.getObjectType(root) == shape:
+                tree.add(root)
+        body = [h for h in plat_tree if h not in ur5_tree and h != self.barrel]
+
+        def volume(h):
+            bb = self._local_bbox(h)
+            return (bb[3] - bb[0]) * (bb[4] - bb[1]) * (bb[5] - bb[2])
+        body.sort(key=volume, reverse=True)
+        self.bump_body = [(h, self._local_bbox(h)) for h in body[:4]]      # the chassis is the big one
+
+        ignore = {norm_name(n) for n in BUMP_IGNORE}
+        self.bump_obstacles = []
+        for h in self._all_objects():
+            if sim.getObjectType(h) != shape or h in plat_tree or h in ur5_tree or h == self.barrel:
+                continue
+            alias = sim.getObjectAlias(h, 0)
+            if norm_name(alias) in ignore:
+                continue
+            lo, hi = self._world_aabb(h, self._local_bbox(h))
+            if hi[2] < FLOOR_TOP_Z:
+                continue                                                  # that's the floor
+            self.bump_obstacles.append((alias, lo, hi))
+        self.bump_baseline = {}
+
+    def body_box(self):
+        """World box (lo, hi) around the platform body (chassis), at its current pose."""
+        lo, hi = [1e9] * 3, [-1e9] * 3
+        for h, bb in self.bump_body:
+            l, u = self._world_aabb(h, bb)
+            lo = [min(lo[i], l[i]) for i in range(3)]
+            hi = [max(hi[i], u[i]) for i in range(3)]
+        return lo, hi
+
+    @staticmethod
+    def _gap_box(lo, hi, olo, ohi):
+        """Horizontal gap between the platform box and an obstacle box (inf if the obstacle is not at body height)."""
+        if ohi[2] < lo[2] + 0.03 or olo[2] > hi[2]:
+            return float("inf")
+        dx = max(0.0, olo[0] - hi[0], lo[0] - ohi[0])
+        dy = max(0.0, olo[1] - hi[1], lo[1] - ohi[1])
+        return math.hypot(dx, dy)
+
+    def _min_gap(self, lo, hi):
+        gaps = [self._gap_box(lo, hi, olo, ohi) for _, olo, ohi in self.bump_obstacles]
+        return min(gaps) if gaps else float("inf")
+
+    def check_bump(self):
+        """
+        Returns the name of an obstacle the platform body is touching (and still closing in on), else None.
+        Something already touching at the start of a drive is only reported if we push further into it.
+        """
+        if not BUMP_STOP or not self.bump_body or not self.bump_obstacles:
+            return None
+        lo, hi = self.body_box()
+        hit = None
+        for name, olo, ohi in self.bump_obstacles:
+            gap = self._gap_box(lo, hi, olo, ohi)
+            base = max(self.bump_baseline.get(name, 0.0), min(gap, 10 * BUMP_MARGIN))
+            self.bump_baseline[name] = base
+            if gap < BUMP_MARGIN and gap < base - 0.003:
+                hit = name
+        return hit
+
+    def park_spot(self, target_xy, from_xy, min_d):
+        """
+        Where to park the UR5 base so that it is at least min_d from target_xy, on the side we come from, and
+        the platform body stays PARK_CLEARANCE away from every obstacle (so it never touches the blocks).
+        Returns (xy, distance_from_target).
+        """
+        lo, hi = self.body_box()
+        base = self.pos(self.ur5)
+        off_lo = [lo[0] - base[0], lo[1] - base[1]]
+        off_hi = [hi[0] - base[0], hi[1] - base[1]]
+        u = vunit(vsub(from_xy, target_xy))
+        if vnorm(u) < 0.5:
+            u = [-1.0, 0.0]
+        d = min_d
+        while d <= PARK_MAX_DIST:
+            c = vadd(target_xy, vscale(u, d))
+            clo = [c[0] + off_lo[0], c[1] + off_lo[1], lo[2]]
+            chi = [c[0] + off_hi[0], c[1] + off_hi[1], hi[2]]
+            if self._min_gap(clo, chi) >= PARK_CLEARANCE:
+                return c, d
+            d += 0.01
+        print(f"  warning: no obstacle-free parking spot found within {PARK_MAX_DIST} m of "
+              f"({target_xy[0]:.2f}, {target_xy[1]:.2f}); parking {min_d:.2f} m away anyway.")
+        return vadd(target_xy, vscale(u, min_d)), min_d
+
+    def surface_z_at(self, xy, fallback_z):
+        """Height of the top of whatever solid object is under xy (the white block), else fallback_z."""
+        best, src = None, None
+        for name, olo, ohi in self.bump_obstacles:
+            if olo[0] - 0.02 <= xy[0] <= ohi[0] + 0.02 and olo[1] - 0.02 <= xy[1] <= ohi[1] + 0.02:
+                if best is None or ohi[2] > best:
+                    best, src = ohi[2], name
+        return (best, src) if best is not None else (fallback_z, None)
+
+    def raise_clear(self, surface_z):
+        """Lift the held barrel so its bottom clears surface_z before it is swung over that surface."""
+        need = (surface_z + RAISE_CLEAR) - self.world_min_z(self.barrel)
+        if need > 0.005:
+            p = self.pose(self.grab_ur5)
+            print(f"  raising the barrel {need * 100:.0f} cm to clear the surface it will be swung over...")
+            self.move_tool([p[0], p[1], p[2] + need] + p[3:])
 
     def swing_to(self, target_xy, steps=MOVE_STEPS, settle=40):
         """
@@ -609,6 +744,7 @@ class Robot:
         """
         dt = self.sim.getSimulationTimeStep()
         self.blocked = False
+        self.bump_baseline = {}
         anchor, commanded = self.pos(self.ur5)[:2], 0.0           # progress bookkeeping for contact detection
         for n in range(DRIVE_MAX_STEPS):
             p = self.pos(self.ur5)[:2]
@@ -629,6 +765,14 @@ class Robot:
             self._set_wheels(c)
             self.step()
             commanded += speed * dt
+            if BUMP_STOP and n % BUMP_CHECK_EVERY == 0:
+                hit = self.check_bump()
+                if hit:
+                    self.blocked = True
+                    self._set_wheels([0.0] * 4)
+                    print(f"  bumped into '{hit}' ({self.pos(self.ur5)[0]:.2f}, {self.pos(self.ur5)[1]:.2f}): "
+                          f"wheels stopped.")
+                    break
             if n % 100 == 0:
                 print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg")
 
@@ -675,7 +819,10 @@ def run_full(robot):
 
         barrel_xy = robot.pos(robot.barrel)[:2]
         start_xy  = robot.pos(robot.ur5)[:2]
-        goal = standoff_goal(barrel_xy, start_xy, ARM_STANDOFF)
+        goal, d_grab = robot.park_spot(barrel_xy, start_xy, ARM_STANDOFF)
+        if d_grab > PLACE_REACH_MAX + 0.05:
+            print(f"  warning: to stay clear of obstacles the platform must park {d_grab:.2f} m from the barrel; "
+                  f"the arm may not reach it.")
         print(f"  driving from ({start_xy[0]:.2f}, {start_xy[1]:.2f}) to ({goal[0]:.2f}, {goal[1]:.2f}) near the barrel...")
         miss = robot.drive_to(goal)
         print(f"  parked {miss * 1000:.0f} mm from the goal")
@@ -684,29 +831,34 @@ def run_full(robot):
         print(f"  Stage 3 (drive + grab): {'PASS' if ok3 else 'FAIL'}")
         robot.lift()
 
-        # Park on the side we arrive from, so PointB is straight ahead at the same reach the grab used. The arm
-        # then swings the barrel around to face PointB, so PointB can be in ANY direction (even behind the barrel).
-        rel = vsub(robot.pos(robot.barrel)[:2], robot.pos(robot.ur5)[:2])
-        reach = vnorm(rel)
+        # Park on the side we arrive from, clear of every solid object (the platform never touches the blocks),
+        # as close to PointB as that allows. The arm then reaches over and sets the barrel down ON PointB's surface.
         b_xy = robot.pos(robot.point_b)[:2]
         cur_xy = robot.pos(robot.ur5)[:2]
-        if robot.platform_at_b:
-            plat_xy  = robot.pos(robot.platform)[:2]
-            ur5_goal = vadd(b_xy, vsub(cur_xy, plat_xy))                         # platform centre ends on PointB
-            place_xy = vadd(ur5_goal, rel)
-        else:
-            ur5_goal = standoff_goal(b_xy, cur_xy, reach)                        # barrel (not platform) ends on PointB
-            place_xy = b_xy
+        ur5_goal, _ = robot.park_spot(b_xy, cur_xy, MIN_PARK_DIST)
+        place_xy = b_xy
         print(f"  driving to PointB ({b_xy[0]:.2f}, {b_xy[1]:.2f}) with the barrel...")
         miss = robot.drive_to(ur5_goal)
         print(f"  parked {miss * 1000:.0f} mm from the goal")
+
+        base_xy = robot.pos(robot.ur5)[:2]
+        to_b = vsub(b_xy, base_xy)
+        if vnorm(to_b) > PLACE_REACH_MAX:                                        # keep the ask inside the arm's reach
+            place_xy = vadd(base_xy, vscale(vunit(to_b), PLACE_REACH_MAX))
+            print(f"  PointB is {vnorm(to_b):.2f} m from the arm base; placing at {PLACE_REACH_MAX:.2f} m instead "
+                  f"(still on the block as long as it is big enough).")
+        surface_z, src = robot.surface_z_at(place_xy, robot.pos(robot.point_b)[2])
+        print(f"  placing on {'the top of ' + repr(src) if src else 'the floor'} (surface z = {surface_z:.3f} m)")
+        robot.raise_clear(surface_z)
         robot.swing_to(place_xy)
 
         ok_side = robot.rotate_sideways()
-        final, elev = robot.lower_and_release(place_xy)
+        final, elev, bottom = robot.lower_and_release(place_xy, surface_z)
         off = vnorm(vsub(final[:2], place_xy))
-        ok4 = ok_side and off < PLACE_TOL_M and elev < SIDEWAYS_TOL_DEG * 3
-        print(f"  barrel ended {off * 1000:.0f} mm from the target spot, axis {elev:.1f} deg from horizontal")
+        on_surface = abs(bottom - surface_z) < 0.05
+        ok4 = ok_side and off < PLACE_TOL_M and elev < SIDEWAYS_TOL_DEG * 3 and on_surface
+        print(f"  barrel ended {off * 1000:.0f} mm from the target spot, axis {elev:.1f} deg from horizontal, "
+              f"bottom {abs(bottom - surface_z) * 1000:.0f} mm from the surface")
         print(f"  Stage 4 (drive + place sideways): {'PASS' if ok4 else 'FAIL'}")
         return ok3 and ok4
     finally:
@@ -722,15 +874,13 @@ def main():
     ap.add_argument("--repeat", type=int, default=1, help="how many times to repeat the chosen mode")
     ap.add_argument("--discover", action="store_true", help="list dummies/shapes and what was resolved, then exit")
     ap.add_argument("--standoff", type=float, default=None, help="UR5-base-to-barrel distance when parked (m)")
-    ap.add_argument("--platform-at-b", action="store_true",
-                    help="put the platform itself on PointB (default: the BARREL is placed on PointB)")
     args = ap.parse_args()
 
     global ARM_STANDOFF
     if args.standoff is not None:
         ARM_STANDOFF = args.standoff
 
-    robot = Robot(platform_at_b=args.platform_at_b)
+    robot = Robot()
     if args.discover:
         robot.discover()
         return 0
