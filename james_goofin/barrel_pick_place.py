@@ -84,6 +84,7 @@ BUMP_STOP        = True               # stop the wheels as soon as the platform 
 BUMP_MARGIN      = 0.02               # m, "touching" = platform body within this distance of the object
 BUMP_CHECK_EVERY = 2                  # sim steps between bump checks
 FLOOR_TOP_Z      = 0.05               # m, shapes whose top is below this are treated as the floor (not an obstacle)
+ROOM_SIZE_M      = 3.0                # m, a shape wider than this in BOTH x and y is the room/floor, not an obstacle
 BUMP_IGNORE      = []                 # aliases of shapes the bump checker should ignore
 PARK_CLEARANCE   = 0.05               # m, platform body stays at least this far from every obstacle when parked
 PARK_MAX_DIST    = 1.6                # m, how far back from the target we search for a clear parking spot
@@ -564,11 +565,22 @@ class Robot:
             alias = sim.getObjectAlias(h, 0)
             if norm_name(alias) in ignore:
                 continue
+            node, under_floor = h, False                                  # the Floor model and its child 'box'
+            while node != -1:
+                if norm_name(sim.getObjectAlias(node, 0)) == "floor":
+                    under_floor = True
+                    break
+                node = sim.getObjectParent(node)
+            if under_floor:
+                continue
             lo, hi = self._world_aabb(h, self._local_bbox(h))
             if hi[2] < FLOOR_TOP_Z:                                       # that's the floor
                 area = (hi[0] - lo[0]) * (hi[1] - lo[1])
                 if self.floor_box is None or area > self.floor_box[2]:
                     self.floor_box = (lo, hi, area)
+                continue
+            if hi[0] - lo[0] > ROOM_SIZE_M and hi[1] - lo[1] > ROOM_SIZE_M:
+                print(f"  note: ignoring room-sized shape '{alias}' as an obstacle")
                 continue
             self.bump_obstacles.append((alias, lo, hi))
         self.bump_baseline = {}
