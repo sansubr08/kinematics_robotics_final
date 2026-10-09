@@ -65,16 +65,16 @@ PATH_WHEELS      = [                 # same order as omni_test_move.py
 
 # --- omni driving ---
 WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from the OmniPlatform lua script
-PATTERN_FWD      = [-1, -1,  1,  1]   # known-good "forward" from omni_test_move.py   [BR, FR, FL, BL]
-PATTERN_STRAFE   = [-1,  1,  1, -1]   # guess; calibration decides which way it really goes
-PATTERN_ROTATE   = [-1, -1, -1, -1]   # guess; calibration decides which way it really goes
-CAL_STEPS        = 25                 # sim steps per calibration burst
-CAL_SETTLE_STEPS = 40                 # sim steps to let the platform coast to a stop
+WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
+CAL_SCALE        = 1.0                # calibration burst speed, as a multiple of WHEEL_V
+CAL_STEPS        = 30                 # sim steps per calibration burst (one wheel at a time)
+CAL_SETTLE_STEPS = 40                 # sim steps to let the platform coast to a stop between bursts
 DRIVE_GAIN       = 2.0                # 1/s, P gain on position error
 DRIVE_MAX_SPEED  = 0.25               # m/s
 DRIVE_TOL        = 0.02               # m, stop when this close
 DRIVE_MAX_STEPS  = 4000
 YAW_GAIN         = 1.5                # 1/s, P gain on heading error
+YAW_MAX_RATE     = 0.5                # rad/s, cap on the turning command that holds the heading
 
 # --- arm / grasp geometry ---
 ARM_STANDOFF     = 0.55    # m, horizontal distance from UR5 base to the barrel when parked for the grab
@@ -177,6 +177,35 @@ def solve_2x2(j1, j2, v):
     c1 = (v[0] * j2[1] - v[1] * j2[0]) / det
     c2 = (j1[0] * v[1] - j1[1] * v[0]) / det
     return c1, c2
+
+def solve_min_norm(A, u):
+    """
+    Smallest wheel-speed vector c with  A c = u.   A is 3 rows (vx, vy, yaw rate) x 4 wheel columns.
+    c = A^T (A A^T)^-1 u.   Returns None if A cannot produce all three motions (singular).
+    """
+    m = [[sum(A[i][k] * A[j][k] for k in range(4)) for j in range(3)] for i in range(3)]
+    det = (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+           - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+           + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+    scale = (m[0][0] + m[1][1] + m[2][2]) / 3.0
+    if scale <= 0.0 or abs(det) < 1e-9 * scale ** 3:
+        return None
+    # Cramer's rule for y = m^-1 u
+    def det3(a):
+        return (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+                - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+                + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+    y = []
+    for col in range(3):
+        mc = [row[:] for row in m]
+        for r in range(3):
+            mc[r][col] = u[r]
+        y.append(det3(mc) / det)
+    return [sum(A[r][k] * y[r] for r in range(3)) for k in range(4)]
+
+def rot2(v, ang):
+    c, s = math.cos(ang), math.sin(ang)
+    return [c * v[0] - s * v[1], s * v[0] + c * v[1]]
 
 def wrap_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
@@ -479,65 +508,117 @@ class Robot:
         final = self.pos(self.barrel)
         return final, axis_elevation_deg(self.barrel_axis_world())
 
+    def swing_to(self, target_xy, steps=MOVE_STEPS, settle=40):
+        """
+        Swing the held barrel around the UR5's base axis (same radius, same height) until it sits on the
+        line from the arm base to target_xy. Used at PointB so the arm can reach it from any side.
+        (A straight-line move between opposite sides would pass through the arm's own base.)
+        """
+        base = self.pos(self.ur5)[:2]
+        cur = vsub(self.pos(self.barrel)[:2], base)
+        want = vsub(target_xy, base)
+        dtheta = wrap_angle(math.atan2(want[1], want[0]) - math.atan2(cur[1], cur[0]))
+        if abs(dtheta) < math.radians(2.0):
+            return
+        print(f"  swinging the barrel {math.degrees(dtheta):+.0f} deg around the arm base toward the drop spot...")
+        start = self.pose(self.grab_ur5)
+        p0, q0 = start[:3], start[3:]
+        rel0 = vsub(p0[:2], base)
+        misses = 0
+        last = start
+        for i in range(1, steps + 1):
+            a = dtheta * i / steps
+            xy = vadd(base, rot2(rel0, a))
+            last = [xy[0], xy[1], p0[2]] + quat_mul(quat_axis_angle([0.0, 0.0, 1.0], a), q0)
+            if not self._ik_to(last):
+                misses += 1
+            self.step()
+        for _ in range(settle):
+            self._ik_to(last)
+            self.step()
+        err = vnorm(vsub(self.pos(self.grab_ur5), last[:3]))
+        if misses > steps * 0.3 or err > 0.03:
+            print(f"  warning: IK trouble during the swing (unsolved {misses}/{steps}, final tool error "
+                  f"{err * 1000:.0f} mm). Try a different --standoff.")
+
     # ---------- omni driving ----------
     def _set_wheels(self, cmd):
         for w, c in zip(self.wheels, cmd):
             self.sim.setJointTargetVelocity(w, c)
 
-    def _burst(self, pattern, scale=1.0):
-        """Run one calibration burst, return (world displacement xy, yaw change) per second."""
+    def _wheel_burst(self, i):
+        """
+        Spin ONLY wheel i, measure what the platform does. Returns the response in the platform's own
+        frame: [forward-ish m/s, sideways-ish m/s, yaw rate rad/s] per rad/s of that wheel.
+        (Nothing is assumed about which wheel does what, or which way the signs go.)
+        """
         sim = self.sim
-        p0, y0, t0 = self.pos(self.ur5)[:2], self.platform_yaw(), sim.getSimulationTime()
-        self._set_wheels([WHEEL_V * scale * c for c in pattern])
-        self.step(CAL_STEPS)
+        dt = sim.getSimulationTimeStep()
+        cmd = [0.0] * 4
+        cmd[i] = WHEEL_V * CAL_SCALE
+        self._set_wheels(cmd)
+        half = CAL_STEPS // 2
+        self.step(half)                                       # let the wheel spin up, discard this part
+        if i == 0:
+            try:                                              # is something else fighting our wheel command?
+                got = sim.getJointTargetVelocity(self.wheels[0])
+                if abs(got - cmd[0]) > 1e-3:
+                    print(f"  WARNING: wheel 0 target velocity reads {got:.3f} after we set {cmd[0]:.3f}. "
+                          f"Something else (the OmniPlatform's own child script?) is overwriting the wheels. "
+                          f"Disable that script in CoppeliaSim.")
+            except Exception:
+                pass
+        p0, y0 = self.pos(self.ur5)[:2], self.platform_yaw()
+        self.step(CAL_STEPS - half)
+        p1, y1 = self.pos(self.ur5)[:2], self.platform_yaw()
         self._set_wheels([0.0] * 4)
         self.step(CAL_SETTLE_STEPS)
-        p1, y1 = self.pos(self.ur5)[:2], self.platform_yaw()
-        # velocity per unit coefficient: displacement while the burst ran, from the actual drive time
-        dt = CAL_STEPS * sim.getSimulationTimeStep()
-        return vscale(vsub(p1, p0), 1.0 / dt), wrap_angle(y1 - y0) / dt
+        t = (CAL_STEPS - half) * dt
+        v_world = vscale(vsub(p1, p0), 1.0 / t)
+        v_body = rot2(v_world, -(y0 + wrap_angle(y1 - y0) / 2.0))        # world -> platform frame
+        w = wrap_angle(y1 - y0) / t
+        k = 1.0 / (WHEEL_V * CAL_SCALE)
+        return [v_body[0] * k, v_body[1] * k, w * k]
 
     def calibrate_omni(self):
-        print("  calibrating wheel mixing (short test bursts)...")
-        j_f, _      = self._burst(PATTERN_FWD)
-        j_s, _      = self._burst(PATTERN_STRAFE)
-        _, w_r      = self._burst(PATTERN_ROTATE, 0.5)
-        if vnorm(j_f) < 1e-3 or vnorm(j_s) < 1e-3:
-            raise RuntimeError("Calibration burst did not move the platform. Check the wheel paths / wheel joint modes "
-                               "(they must be velocity-controlled and the platform must not be fixed).")
-        if solve_2x2(j_f, j_s, [1.0, 0.0]) is None:
-            raise RuntimeError("Forward and strafe patterns move the platform along the same line, so the "
-                               "PATTERN_STRAFE guess is wrong for this platform. Edit PATTERN_STRAFE.")
-        self.j_f, self.j_s = j_f, j_s
-        self.w_r = w_r if abs(w_r) > 1e-3 else None
-        if self.w_r is None:
-            print("  note: rotation pattern produced no yaw change, so heading hold is disabled.")
-        self.drive_yaw = self.platform_yaw()
+        print("  calibrating wheels (one wheel at a time, short bursts)...")
+        self.heading0 = self.platform_yaw()            # the heading we will hold while driving
+        cols = [self._wheel_burst(i) for i in range(4)]
+        self.A = [[cols[k][r] for k in range(4)] for r in range(3)]       # 3 x 4: body (vx, vy, yaw) per wheel
+        names = ["back right", "front right", "front left", "back left"]
+        print("    response per wheel (rad/s):   body-x m/s | body-y m/s | yaw rad/s")
+        for k in range(4):
+            print(f"      wheel {k} ({names[k]:11s}): {cols[k][0]:+.4f} | {cols[k][1]:+.4f} | {cols[k][2]:+.4f}")
+        if max(abs(x) for c in cols for x in c) < 1e-4:
+            raise RuntimeError("No wheel moved the platform. Check the wheel paths and that the wheel joints are "
+                               "velocity-controlled and the platform is not fixed/static.")
+        if solve_min_norm(self.A, [1.0, 0.0, 0.0]) is None:
+            raise RuntimeError("The four wheels cannot produce all of forward, sideways and turning motion "
+                               "(calibration matrix is singular). Paste the response table above to me.")
         self.step(10)
 
     def drive_to(self, goal_xy, tol=DRIVE_TOL):
-        """Drive the UR5 base to goal_xy (world xy) using the calibrated wheel mixing, holding heading."""
-        sim = self.sim
-        for _ in range(DRIVE_MAX_STEPS):
+        """Drive the UR5 base to goal_xy (world xy) with the calibrated wheel model, holding the start heading."""
+        for n in range(DRIVE_MAX_STEPS):
             p = self.pos(self.ur5)[:2]
             err = vsub(goal_xy, p)
             dist = vnorm(err)
+            yaw = self.platform_yaw()
+            yaw_err = wrap_angle(self.heading0 - yaw)
             if dist < tol:
                 break
             speed = min(DRIVE_MAX_SPEED, DRIVE_GAIN * dist)
-            v_des = vscale(err, speed / dist)
-            c = solve_2x2(self.j_f, self.j_s, v_des)
-            cf, cs = c
-            cr = 0.0
-            if self.w_r is not None:
-                yaw_err = wrap_angle(self.drive_yaw - self.platform_yaw())
-                cr = (YAW_GAIN * yaw_err) / self.w_r * 0.5
-            cmd = [WHEEL_V * (cf * PATTERN_FWD[i] + cs * PATTERN_STRAFE[i] + cr * PATTERN_ROTATE[i]) for i in range(4)]
-            peak = max(abs(x) for x in cmd)
-            if peak > 2.0 * WHEEL_V:
-                cmd = [x * 2.0 * WHEEL_V / peak for x in cmd]
-            self._set_wheels(cmd)
+            v_world = vscale(err, speed / dist)
+            v_body = rot2(v_world, -yaw)                                          # into the platform's frame
+            w_des = max(-YAW_MAX_RATE, min(YAW_MAX_RATE, YAW_GAIN * yaw_err))
+            c = solve_min_norm(self.A, [v_body[0], v_body[1], w_des])
+            peak = max(abs(x) for x in c)
+            if peak > WHEEL_MAX:
+                c = [x * WHEEL_MAX / peak for x in c]
+            self._set_wheels(c)
             self.step()
+            if n % 100 == 0:
+                print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg")
         else:
             print("  (drive timed out before reaching the goal)")
         self._set_wheels([0.0] * 4)
@@ -581,19 +662,23 @@ def run_full(robot):
         print(f"  Stage 3 (drive + grab): {'PASS' if ok3 else 'FAIL'}")
         robot.lift()
 
-        # remember where the barrel sat relative to the arm, so the drop spot is one the arm can reach
+        # Park on the side we arrive from, so PointB is straight ahead at the same reach the grab used. The arm
+        # then swings the barrel around to face PointB, so PointB can be in ANY direction (even behind the barrel).
         rel = vsub(robot.pos(robot.barrel)[:2], robot.pos(robot.ur5)[:2])
+        reach = vnorm(rel)
         b_xy = robot.pos(robot.point_b)[:2]
+        cur_xy = robot.pos(robot.ur5)[:2]
         if robot.platform_at_b:
-            plat_xy   = robot.pos(robot.platform)[:2]
-            ur5_goal  = vadd(b_xy, vsub(robot.pos(robot.ur5)[:2], plat_xy))      # platform centre ends on PointB
-            place_xy  = vadd(ur5_goal, rel)
+            plat_xy  = robot.pos(robot.platform)[:2]
+            ur5_goal = vadd(b_xy, vsub(cur_xy, plat_xy))                         # platform centre ends on PointB
+            place_xy = vadd(ur5_goal, rel)
         else:
-            ur5_goal  = vsub(b_xy, rel)                                          # barrel (not platform) ends on PointB
-            place_xy  = b_xy
+            ur5_goal = standoff_goal(b_xy, cur_xy, reach)                        # barrel (not platform) ends on PointB
+            place_xy = b_xy
         print(f"  driving to PointB ({b_xy[0]:.2f}, {b_xy[1]:.2f}) with the barrel...")
         miss = robot.drive_to(ur5_goal)
         print(f"  parked {miss * 1000:.0f} mm from the goal")
+        robot.swing_to(place_xy)
 
         ok_side = robot.rotate_sideways()
         final, elev = robot.lower_and_release(place_xy)
