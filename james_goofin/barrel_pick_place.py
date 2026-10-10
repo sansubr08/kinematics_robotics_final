@@ -89,6 +89,7 @@ BUMP_IGNORE      = []                 # aliases of shapes the bump checker shoul
 PARK_CLEARANCE   = 0.05               # m, platform body stays at least this far from every obstacle when parked
 PARK_MAX_DIST    = 1.6                # m, how far back from the target we search for a clear parking spot
 MIN_PARK_DIST    = 0.35               # m, closest the arm base is allowed to park to the drop spot
+CARRY_RADIUS     = 0.50               # m, the held barrel is pulled in to this distance from the arm base after the grab
 PLACE_REACH_MAX  = 0.55               # m, farthest horizontal reach asked of the arm when placing
 RAISE_CLEAR      = 0.05               # m, barrel bottom stays this far above a surface it is swung over
 
@@ -509,6 +510,20 @@ class Robot:
         p = self.pose(self.grab_ur5)
         self.move_tool([p[0], p[1], p[2] + LIFT_HEIGHT] + p[3:])
 
+    def retract(self, radius):
+        """Pull the held barrel in towards the arm base (same height) so it is carried at a reachable radius."""
+        base = self.pos(self.ur5)[:2]
+        c = self.pos(self.barrel)
+        v = vsub(c[:2], base)
+        r = vnorm(v)
+        if r <= radius + 0.02:
+            return
+        shift = vscale(vunit(v), radius - r)
+        t = self.pose(self.grab_ur5)
+        print(f"  pulling the barrel in from {r:.2f} m to {radius:.2f} m from the arm base...")
+        self.move_tool([t[0] + shift[0], t[1] + shift[1], t[2]] + t[3:])
+        print(f"  barrel now {vnorm(vsub(self.pos(self.barrel)[:2], base)):.2f} m from the arm base")
+
     def rotate_sideways(self):
         """Stage 2: rotate the held barrel about the grab point until its axis is horizontal."""
         axis = self.barrel_axis_world()
@@ -540,6 +555,9 @@ class Robot:
         dz = (surface_z + FLOOR_CLEARANCE) - self.world_min_z(self.barrel)
         tool = self.pose(self.grab_ur5)
         self.move_tool([tool[0], tool[1], tool[2] + dz] + tool[3:])                        # lower
+        c = self.pos(self.barrel)
+        print(f"  before release: barrel {math.hypot(target_xy[0]-c[0], target_xy[1]-c[1])*1000:.0f} mm from the spot, "
+              f"bottom {abs(self.world_min_z(self.barrel)-surface_z)*1000:.0f} mm from the surface")
         self.release_barrel()
         final = self.pos(self.barrel)
         return final, axis_elevation_deg(self.barrel_axis_world()), self.world_min_z(self.barrel)
@@ -953,6 +971,7 @@ def run_full(robot):
         ok3 = robot.grab()
         print(f"  Stage 3 (drive + grab): {'PASS' if ok3 else 'FAIL'}")
         robot.lift()
+        robot.retract(CARRY_RADIUS)
 
         # Where the barrel goes: park on the side we arrive from, clear of every solid object (the platform never
         # touches the blocks), as close to PointB as that allows, and set the barrel down ON the surface at PointB.
