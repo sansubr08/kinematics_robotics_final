@@ -448,8 +448,11 @@ class Robot:
         for _ in range(max_steps):
             self._ik_to(list(target_pose))
             self.step()
-            err = vnorm(vsub(self.pos(self.grab_ur5), target_pose[:3]))
-            good = good + 1 if err < tol else 0
+            cur = self.pose(self.grab_ur5)
+            err = vnorm(vsub(cur[:3], target_pose[:3]))
+            dot = abs(sum(a * b for a, b in zip(cur[3:], target_pose[3:])))
+            ang = 2.0 * math.acos(min(1.0, dot))                              # orientation error, rad
+            good = good + 1 if (err < tol and ang < math.radians(2.0)) else 0
             if good >= 5:
                 break
         return err
@@ -535,6 +538,14 @@ class Robot:
         print(f"  barrel axis is {before:.0f} deg off horizontal, rotating...")
         self.move_tool(p[:3] + q_new, steps=ROTATE_STEPS)
         after = axis_elevation_deg(self.barrel_axis_world())
+        for _ in range(3):                                                    # the arm lags: finish the turn if it fell short
+            if after < SIDEWAYS_TOL_DEG:
+                break
+            radial = vsub(self.pos(self.barrel)[:2], self.pos(self.ur5)[:2])
+            q_rot = sideways_rotation(self.barrel_axis_world(), radial)
+            p = self.pose(self.grab_ur5)
+            self.move_tool(p[:3] + quat_mul(q_rot, p[3:]), steps=ROTATE_STEPS // 2)
+            after = axis_elevation_deg(self.barrel_axis_world())
         print(f"  barrel axis now {after:.1f} deg from horizontal")
         return after < SIDEWAYS_TOL_DEG
 
