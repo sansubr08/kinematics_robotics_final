@@ -89,7 +89,7 @@ BUMP_IGNORE      = []                 # aliases of shapes the bump checker shoul
 PARK_CLEARANCE   = 0.05               # m, platform body stays at least this far from every obstacle when parked
 PARK_MAX_DIST    = 1.6                # m, how far back from the target we search for a clear parking spot
 MIN_PARK_DIST    = 0.35               # m, closest the arm base is allowed to park to the drop spot
-PLACE_REACH_MAX  = 0.70               # m, farthest horizontal reach asked of the arm when placing
+PLACE_REACH_MAX  = 0.55               # m, farthest horizontal reach asked of the arm when placing
 RAISE_CLEAR      = 0.05               # m, barrel bottom stays this far above a surface it is swung over
 
 # --- arm / grasp geometry ---
@@ -530,6 +530,13 @@ class Robot:
         dx = target_xy[0] - center[0]
         dy = target_xy[1] - center[1]
         self.move_tool([tool[0] + dx, tool[1] + dy, tool[2]] + tool[3:])                   # slide over the spot
+        for _ in range(3):                                                                 # re-aim if the arm fell short
+            c = self.pos(self.barrel)
+            ex, ey = target_xy[0] - c[0], target_xy[1] - c[1]
+            if math.hypot(ex, ey) < 0.01:
+                break
+            t = self.pose(self.grab_ur5)
+            self.move_tool([t[0] + ex, t[1] + ey, t[2]] + t[3:])
         dz = (surface_z + FLOOR_CLEARANCE) - self.world_min_z(self.barrel)
         tool = self.pose(self.grab_ur5)
         self.move_tool([tool[0], tool[1], tool[2] + dz] + tool[3:])                        # lower
