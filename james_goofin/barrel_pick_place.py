@@ -89,8 +89,8 @@ BUMP_IGNORE      = []                 # aliases of shapes the bump checker shoul
 PARK_CLEARANCE   = 0.05               # m, platform body stays at least this far from every obstacle when parked
 PARK_MAX_DIST    = 1.6                # m, how far back from the target we search for a clear parking spot
 MIN_PARK_DIST    = 0.35               # m, closest the arm base is allowed to park to the drop spot
-CARRY_RADIUS     = 0.60               # m, the held barrel is pulled in to this distance from the arm base after the grab
-PLACE_REACH_MAX  = 0.55               # m, farthest horizontal reach asked of the arm when placing
+CARRY_RADIUS     = 0                  # m, the held barrel is pulled in to this distance from the arm base after the grab
+PLACE_REACH_MAX  = 0.80               # m, farthest horizontal reach asked of the arm when placing
 RAISE_CLEAR      = 0.05               # m, barrel bottom stays this far above a surface it is swung over
 
 # --- arm / grasp geometry ---
@@ -557,7 +557,7 @@ class Robot:
         self.move_tool([tool[0], tool[1], tool[2] + dz] + tool[3:])                        # lower
         for _ in range(4):                                                                 # keep going until it is really down
             gap = self.world_min_z(self.barrel) - (surface_z + FLOOR_CLEARANCE)
-            if abs(gap) < 0.008:
+            if gap < 0.008:                                                                # never push down into the block
                 break
             t = self.pose(self.grab_ur5)
             self.move_tool([t[0], t[1], t[2] - gap] + t[3:])
@@ -977,7 +977,8 @@ def run_full(robot):
         ok3 = robot.grab()
         print(f"  Stage 3 (drive + grab): {'PASS' if ok3 else 'FAIL'}")
         robot.lift()
-        robot.retract(CARRY_RADIUS)
+        if CARRY_RADIUS:
+            robot.retract(CARRY_RADIUS)
 
         # Where the barrel goes: park on the side we arrive from, clear of every solid object (the platform never
         # touches the blocks), as close to PointB as that allows, and set the barrel down ON the surface at PointB.
