@@ -1,16 +1,18 @@
 """
-CoppeliaSim: ABB IRB 140 follows a moving sphere with its tip.
+CoppeliaSim: ABB IRB 140 and a Quadcopter both follow a moving sphere.
 
-- Robot base at (0, -0.5, 0), rotated +90 deg about z
+- IRB 140 base at (0, -0.5, 0), rotated +90 deg about z
 - Sphere oscillates along the line (-0.5, 0, 0.25) -> (0.5, 0, 0.25)
 - Robot tip tracked with position-only IK (simIK)
+- Quadcopter hovers 2 m above the sphere, driven by the model's own
+  target-following controller (we move its target dummy each step)
 
 Setup:
     pip install coppeliasim-zmqremoteapi-client
     Start CoppeliaSim (any empty scene), then run:
         python irb140_follow_sphere.py
-    Optional: pass the full path to the IRB 140 model if the default isn't found:
-        python irb140_follow_sphere.py "/path/to/ABB IRB 140.ttm"
+    Optional: pass full model paths if the defaults aren't found:
+        python irb140_follow_sphere.py "/path/to/ABB IRB 140.ttm" "/path/to/Quadcopter.ttm"
 """
 import math
 import os
@@ -24,9 +26,11 @@ ROBOT_YAW = math.pi / 2          # +90 deg about z
 LINE_A = [-0.5, 0.0, 0.25]
 LINE_B = [0.5, 0.0, 0.25]
 SPHERE_DIAMETER = 0.06
+QUAD_OFFSET = [0.0, 0.0, 2.0]    # quadcopter target = sphere + 2 m in z
 PERIOD = 6.0                     # seconds for one full back-and-forth cycle
 SIM_TIME = 30.0                  # seconds to run
-MODEL_REL_PATH = "/robots/non-mobile/ABB IRB 140.ttm"
+IRB_REL_PATH = "/robots/non-mobile/ABB IRB 140.ttm"
+QUAD_REL_PATH = "/robots/mobile/Quadcopter.ttm"
 FLANGE_OFFSET = 0.065            # used only if the model has no tip dummy
 
 # ---------------- connect ----------------
@@ -39,7 +43,7 @@ while sim.getSimulationState() != sim.simulation_stopped:
     pass
 
 # Remove only leftovers from earlier runs (floor, camera, lights are kept)
-MY_ALIASES = ("IRB140", "TargetSphere", "IK_target")
+MY_ALIASES = ("IRB140", "TargetSphere", "IK_target", "Quadcopter")
 to_remove = []
 for h in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 1):
     alias = sim.getObjectAlias(h, 0)
@@ -48,14 +52,15 @@ for h in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 1):
 if to_remove:
     sim.removeObjects(list(dict.fromkeys(to_remove)))
 
-# The arm is moved kinematically by IK, so turn physics off.
-# Otherwise gravity pulls the links apart (joints aren't dynamically driven).
-sim.setBoolParam(sim.boolparam_dynamics_handling_enabled, False)
+# Physics stays ON: the quadcopter needs it to fly. The arm is moved
+# kinematically by IK, so its shapes are made static further below.
+sim.setBoolParam(sim.boolparam_dynamics_handling_enabled, True)
 
-# ---------------- load robot ----------------
-def find_model_path():
-    if len(sys.argv) > 1:
-        return sys.argv[1]
+
+# ---------------- model path lookup ----------------
+def find_model_path(rel_path, argv_index):
+    if len(sys.argv) > argv_index:
+        return sys.argv[argv_index]
     # Try the CoppeliaSim install directory via whichever constant this version has
     for name in ("stringparam_application_path", "stringparam_modeldir"):
         const = getattr(sim, name, None)
@@ -66,7 +71,7 @@ def find_model_path():
         except Exception:
             continue
         for sub in ("/models", ""):
-            candidate = base + sub + MODEL_REL_PATH
+            candidate = base + sub + rel_path
             if os.path.exists(candidate):
                 return candidate
     # Fall back to common install locations
@@ -76,21 +81,28 @@ def find_model_path():
         "C:/Program Files/CoppeliaRobotics/CoppeliaSimEdu/models",
         "C:/Program Files/CoppeliaRobotics/CoppeliaSimPlayer/models",
     ):
-        candidate = root + MODEL_REL_PATH
+        candidate = root + rel_path
         if os.path.exists(candidate):
             return candidate
     raise RuntimeError(
-        "Couldn't locate 'ABB IRB 140.ttm'. Pass its full path as an argument:\n"
-        '  python irb140_follow_sphere.py "/path/to/ABB IRB 140.ttm"'
+        f"Couldn't locate model '{os.path.basename(rel_path)}'. Pass full paths as arguments:\n"
+        '  python irb140_follow_sphere.py "/path/to/ABB IRB 140.ttm" "/path/to/Quadcopter.ttm"'
     )
 
 
-model_path = find_model_path()
-print("Loading model:", model_path)
+# ---------------- load IRB 140 ----------------
+irb_path = find_model_path(IRB_REL_PATH, 1)
+print("Loading robot arm:", irb_path)
 
-robot = sim.loadModel(model_path)
+robot = sim.loadModel(irb_path)
 sim.setObjectPosition(robot, ROBOT_POS, sim.handle_world)
 sim.setObjectOrientation(robot, [0.0, 0.0, ROBOT_YAW], sim.handle_world)
+
+# The arm is driven kinematically: make its shapes static so gravity can't
+# pull the links apart now that physics is on.
+for shp in sim.getObjectsInTree(robot, sim.object_shape_type, 0):
+    sim.setObjectInt32Param(shp, sim.shapeintparam_static, 1)
+    sim.setObjectInt32Param(shp, sim.shapeintparam_respondable, 0)
 
 # ---------------- find joints and tip ----------------
 joints = sim.getObjectsInTree(robot, sim.object_joint_type, 0)
@@ -131,6 +143,33 @@ sim.setObjectAlias(target, "IK_target")
 sim.setObjectPosition(target, LINE_A, sim.handle_world)
 sim.setObjectParent(target, sphere, True)   # target rides on the sphere
 
+# ---------------- load Quadcopter ----------------
+quad_path = find_model_path(QUAD_REL_PATH, 2)
+print("Loading quadcopter:", quad_path)
+
+quad = sim.loadModel(quad_path)
+quad_start = [LINE_A[i] + QUAD_OFFSET[i] for i in range(3)]
+sim.setObjectPosition(quad, quad_start, sim.handle_world)
+
+# The Quadcopter model's built-in controller chases a dummy called "target".
+quad_target = None
+for d in sim.getObjectsInTree(quad, sim.object_dummy_type, 0):
+    if "target" in sim.getObjectAlias(d, 0).lower():
+        quad_target = d
+        break
+if quad_target is None:
+    for d in sim.getObjectsInTree(sim.handle_scene, sim.object_dummy_type, 1):
+        if sim.getObjectAlias(d, 0).lower() in ("quadcopter_target", "target"):
+            quad_target = d
+            break
+if quad_target is None:
+    raise RuntimeError("Couldn't find the Quadcopter's target dummy in the model or scene.")
+
+# Detach the target from the quadcopter so it doesn't move with it
+sim.setObjectParent(quad_target, -1, True)
+sim.setObjectAlias(quad_target, "Quadcopter_target")
+sim.setObjectPosition(quad_target, quad_start, sim.handle_world)
+
 # ---------------- IK setup (position only) ----------------
 ik_env = simIK.createEnvironment()
 ik_group = simIK.createGroup(ik_env)
@@ -154,6 +193,11 @@ try:
         s = 0.5 * (1.0 - math.cos(2.0 * math.pi * t / PERIOD))
         p = [LINE_A[i] + s * (LINE_B[i] - LINE_A[i]) for i in range(3)]
         sim.setObjectPosition(sphere, p, sim.handle_world)
+
+        # Quadcopter controller chases this point: 2 m above the sphere
+        sim.setObjectPosition(
+            quad_target, [p[i] + QUAD_OFFSET[i] for i in range(3)], sim.handle_world
+        )
 
         simIK.handleGroup(ik_env, ik_group, {"syncWorlds": True})
         client.step()
