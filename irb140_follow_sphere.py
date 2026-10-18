@@ -98,6 +98,31 @@ robot = sim.loadModel(irb_path)
 sim.setObjectPosition(robot, ROBOT_POS, sim.handle_world)
 sim.setObjectOrientation(robot, [0.0, 0.0, ROBOT_YAW], sim.handle_world)
 
+# The IRB 140 model ships with its own embedded script (its own IK + cleanup)
+# that fights ours and errors on cleanup. Disable every script in its tree.
+def disable_embedded_scripts(model):
+    disabled = 0
+    for h in sim.getObjectsInTree(model, sim.handle_all, 0):
+        for type_name in ("scripttype_simulation", "scripttype_childscript"):
+            script_type = getattr(sim, type_name, None)
+            if script_type is None:
+                continue
+            try:
+                s = sim.getScript(script_type, h)
+                if s != -1:
+                    sim.setScriptInt32Param(s, sim.scriptintparam_enabled, 0)
+                    disabled += 1
+            except Exception:
+                pass
+    return disabled
+
+
+n_disabled = disable_embedded_scripts(robot)
+print(f"Disabled {n_disabled} embedded script(s) on the IRB 140")
+if n_disabled == 0:
+    print("WARNING: no embedded script found/disabled; if you still see "
+          "simIK errors, disable the IRB140 script manually in the scene hierarchy.")
+
 # The arm is driven kinematically: make its shapes static so gravity can't
 # pull the links apart now that physics is on.
 for shp in sim.getObjectsInTree(robot, sim.object_shape_type, 0):
