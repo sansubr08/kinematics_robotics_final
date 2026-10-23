@@ -318,6 +318,10 @@ print("DEBUG chosen quad target:", sim.getObjectAlias(quad_target, 1))
 # handle and just move it every step.
 sim.setObjectPosition(quad_target, quad_start, sim.handle_world)
 
+# Hide the target marker (the big ball in the sky) so only the real sphere shows.
+# It still works as the controller's setpoint; it just isn't drawn.
+sim.setObjectInt32Param(quad_target, sim.objintparam_visibility_layer, 0)
+
 # ---------------- IK setup (position only) ----------------
 ik_env = simIK.createEnvironment()
 ik_group = simIK.createGroup(ik_env)
