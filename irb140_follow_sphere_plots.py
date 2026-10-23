@@ -272,26 +272,42 @@ sim.setObjectParent(target, sphere, True)   # target rides on the sphere
 quad_path = find_model_path(QUAD_REL_PATH, 2)
 print("Loading quadcopter:", quad_path)
 
+before_load = set(sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 0))
 quad = sim.loadModel(quad_path)
 quad_start = [LINE_A[i] + QUAD_OFFSET[i] for i in range(3)]
 sim.setObjectPosition(quad, quad_start, sim.handle_world)
 
-# The Quadcopter model's built-in controller chases a dummy called "target".
-quad_target = None
-for d in sim.getObjectsInTree(quad, sim.object_dummy_type, 0):
-    if "target" in sim.getObjectAlias(d, 0).lower():
-        quad_target = d
-        break
-if quad_target is None:
-    for d in sim.getObjectsInTree(sim.handle_scene, sim.object_dummy_type, 1):
-        if sim.getObjectAlias(d, 0).lower() in ("quadcopter_target", "target"):
-            quad_target = d
-            break
-if quad_target is None:
-    raise RuntimeError("Couldn't find the Quadcopter's target dummy in the model or scene.")
+# The Quadcopter's controller chases a target dummy. Only accept dummies that
+# appeared when the quadcopter loaded (never the IRB 140's own "target").
+new_objs = [h for h in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 0)
+            if h not in before_load]
+new_dummies = set(sim.getObjectsInTree(sim.handle_scene, sim.object_dummy_type, 0))
+print("DEBUG objects added by quadcopter load:",
+      [(sim.getObjectAlias(h, 1), "dummy" if h in new_dummies else "other") for h in new_objs])
+cands = [h for h in new_objs
+         if h in new_dummies and "target" in sim.getObjectAlias(h, 0).lower()]
+quad_target = cands[0] if cands else None
 
-print("DEBUG dummies in quadcopter model:",
-      [sim.getObjectAlias(d, 1) for d in sim.getObjectsInTree(quad, sim.object_dummy_type, 0)])
+if quad_target is None:
+    print("DEBUG no target dummy found. Controller script lines mentioning 'target':")
+    for tname in ("scripttype_simulation", "scripttype_childscript", "scripttype_customization"):
+        ttype = getattr(sim, tname, None)
+        if ttype is None:
+            continue
+        for h in new_objs:
+            try:
+                sc = sim.getScript(ttype, h)
+                if sc == -1:
+                    continue
+                text = sim.getScriptStringParam(sc, sim.scriptstringparam_text)
+            except Exception:
+                continue
+            print(f"DEBUG --- {tname} on {sim.getObjectAlias(h, 1)}")
+            for line in text.splitlines():
+                if "target" in line.lower() or "getobject" in line.lower():
+                    print("DEBUG   ", line.strip())
+    raise RuntimeError("Couldn't find the Quadcopter's target dummy. Paste the DEBUG lines above.")
+
 print("DEBUG chosen quad target:", sim.getObjectAlias(quad_target, 1))
 
 # Detach the target from the quadcopter so it doesn't move with it
