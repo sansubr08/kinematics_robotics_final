@@ -284,8 +284,11 @@ new_objs = [h for h in sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 0)
 new_dummies = set(sim.getObjectsInTree(sim.handle_scene, sim.object_dummy_type, 0))
 print("DEBUG objects added by quadcopter load:",
       [(sim.getObjectAlias(h, 1), "dummy" if h in new_dummies else "other") for h in new_objs])
-cands = [h for h in new_objs
-         if h in new_dummies and "target" in sim.getObjectAlias(h, 0).lower()]
+# The model's controller script does sim.getObject('../target'), so the target
+# is any object (not necessarily a dummy) whose alias is exactly "target".
+cands = [h for h in new_objs if sim.getObjectAlias(h, 0).lower() == "target"]
+if not cands:
+    cands = [h for h in new_objs if "target" in sim.getObjectAlias(h, 0).lower()]
 quad_target = cands[0] if cands else None
 
 if quad_target is None:
@@ -310,9 +313,9 @@ if quad_target is None:
 
 print("DEBUG chosen quad target:", sim.getObjectAlias(quad_target, 1))
 
-# Detach the target from the quadcopter so it doesn't move with it
-sim.setObjectParent(quad_target, -1, True)
-sim.setObjectAlias(quad_target, "Quadcopter_target")
+# Do NOT reparent or rename the target here: the controller script looks it up
+# as '../target' when the simulation starts and detaches it itself. We keep the
+# handle and just move it every step.
 sim.setObjectPosition(quad_target, quad_start, sim.handle_world)
 
 # ---------------- IK setup (position only) ----------------
