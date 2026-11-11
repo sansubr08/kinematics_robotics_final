@@ -24,9 +24,12 @@ Inputs:
                  GrabPoint_Barrel (on the barrel)
                  PointB           (where the barrel should end up)
         the barrel shape (found as the parent of GrabPoint_Barrel, or by an alias with "barrel")
+        the walking human (Walkin' Bill): found by an alias containing "bill", "human", "person", ...
+                           (or pass --human NAME, or --no-human-sensor to turn the safety off)
 
 Outputs:
     Simulated pick, rotate, drive, place. Prints a PASS/FAIL line per stage.
+    If the human comes within HUMAN_STOP_RADIUS of the arm, the wheels stop and the arm retracts at once.
 
 NOTES:
     - Run python barrel_pick_place.py --discover first. It lists the dummies/shapes it found,
@@ -36,6 +39,14 @@ NOTES:
     - The barrel is "glued" by making it static, non-respondable, and parenting it to
       GrabPoint_UR5 after snapping GrabPoint_Barrel exactly onto GrabPoint_UR5.
     - Everything tunable is in the CONSTANTS block right below the imports.
+    - HUMAN SAFETY: a virtual proximity sensor measures the horizontal distance between the human and the
+      nearest point of the arm (every UR5 joint, the tool point, and the barrel while it is held). Inside
+      HUMAN_STOP_RADIUS the wheels are stopped and the UR5 joints are sent straight back to their start pose
+      (no IK, so it cannot fail to solve). Once the human has stayed outside HUMAN_STOP_RADIUS +
+      HUMAN_CLEAR_MARGIN for a while, the arm eases back out and the interrupted move carries on. If the
+      human never leaves (HUMAN_MAX_WAIT_STEPS) the run is aborted and counted as FAIL.
+      The human's position is read from the model's base and its largest shapes, so it works whichever of
+      them the walking script moves.
 """
 
 
@@ -108,6 +119,15 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
+
+# --- human safety (proximity sensor -> retract the arm) ---
+HUMAN_ALIASES        = ["bill", "human", "person", "pedestrian", "walker"]   # alias substrings used to find the human (--human overrides)
+HUMAN_STOP_RADIUS    = 0.8     # m, a human closer than this to ANY part of the arm (or the held barrel) trips the sensor
+HUMAN_CLEAR_MARGIN   = 0.2     # m, the human must get this much farther than the stop radius to count as clear
+HUMAN_CLEAR_CHECKS   = 15      # consecutive sensor readings the human must stay clear before the arm goes back out
+HUMAN_CHECK_EVERY    = 2       # sim steps between sensor readings
+HUMAN_RESUME_STEPS   = 60      # sim steps taken to re-extend the arm after the human has left
+HUMAN_MAX_WAIT_STEPS = 2400    # sim steps to wait for the human to leave before giving up (the run is then aborted)
 
 
 
@@ -238,13 +258,56 @@ def standoff_goal(barrel_xy, from_xy, standoff):
         d = [-1.0, 0.0]
     return vadd(barrel_xy, vscale(d, standoff))
 
+def min_pair_distance(pts_a, pts_b):
+    """Smallest horizontal (xy) distance between any point of pts_a and any point of pts_b."""
+    best = float("inf")
+    for a in pts_a:
+        for b in pts_b:
+            d = math.hypot(a[0] - b[0], a[1] - b[1])
+            if d < best:
+                best = d
+    return best
+
+class HumanTooClose(RuntimeError):
+    """The human stayed inside the stop radius for longer than HUMAN_MAX_WAIT_STEPS."""
+
+class ProximitySensor:
+    """
+    Turns a stream of distances into a near/clear state with hysteresis, so a human hovering right at the edge
+    of the stop radius does not make the arm twitch in and out.
+        trips (near = True)  as soon as a reading is below stop_radius
+        clears (near = False) only after clear_checks readings in a row above clear_radius
+    """
+    def __init__(self, stop_radius, clear_radius, clear_checks):
+        self.stop_radius  = stop_radius
+        self.clear_radius = max(clear_radius, stop_radius)
+        self.clear_checks = clear_checks
+        self.reset()
+
+    def reset(self):
+        self.near = False
+        self._clear_count = 0
+
+    def update(self, dist):
+        if not self.near:
+            if dist < self.stop_radius:
+                self.near = True
+                self._clear_count = 0
+        elif dist > self.clear_radius:
+            self._clear_count += 1
+            if self._clear_count >= self.clear_checks:
+                self.near = False
+        else:
+            self._clear_count = 0
+        return self.near
+
 
 
 #### SIM WRAPPER
 class Robot:
     """Everything that talks to CoppeliaSim lives in here."""
 
-    def __init__(self):
+    def __init__(self, human_name=None, use_human_sensor=True):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
         self.sim    = self.client.require("sim")
@@ -252,6 +315,18 @@ class Robot:
         self.ik_env = self.ik_group = self.ik_target = None
         self.A = None                      # wheel response matrix, filled in once by calibrate_once()
         self.floor_box = None
+        # human safety state
+        self.human_name       = human_name
+        self.use_human_sensor = use_human_sensor
+        self.human            = None       # handle of the human model (top of its tree)
+        self.human_points     = []         # handles whose positions together describe where the human is
+        self.human_sensor     = ProximitySensor(HUMAN_STOP_RADIUS, HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN, HUMAN_CLEAR_CHECKS)
+        self.guard_on         = False      # True only while a run is in progress
+        self.guard_intervened = False      # set after a retract/resume so loops can reset their progress bookkeeping
+        self.human_trips      = 0
+        self.barrel_held      = False
+        self._guarding        = False      # stops the guard from re-entering itself
+        self._guard_tick      = 0
         self._resolve()
 
     # ---------- finding things ----------
@@ -311,6 +386,40 @@ class Robot:
         self.barrel_respond0     = sim.getObjectInt32Param(self.barrel, sim.shapeintparam_respondable)
         self.floor_z             = self.world_min_z(self.barrel)
         self._build_bump_monitor()
+        self._resolve_human()
+
+    def _resolve_human(self):
+        """Find the walking human (the topmost object whose alias matches) and the handles that track where he is."""
+        sim = self.sim
+        self.human, self.human_points = None, []
+        if not self.use_human_sensor:
+            print("  human-proximity sensor DISABLED (--no-human-sensor): the arm will NOT retract for people.")
+            return
+        hints = [norm_name(self.human_name)] if self.human_name else [norm_name(h) for h in HUMAN_ALIASES]
+        hits = [h for h in self._all_objects() if any(x in norm_name(sim.getObjectAlias(h, 0)) for x in hints)]
+        hit_set = set(hits)
+        robot_tree = set(sim.getObjectsInTree(self.platform, sim.handle_all, 0)) | {self.platform}
+        tops = [h for h in hits if sim.getObjectParent(h) not in hit_set     # the model root, not its body parts
+                and h not in robot_tree and h != self.barrel]
+        if not tops:
+            raise RuntimeError(f"Could not find the human (looked for an alias containing {hints}). Run with --discover to "
+                               f"see what is in the scene, then pass --human NAME, or use --no-human-sensor to run without it.")
+        self.human = tops[0]
+        if len(tops) > 1:
+            print(f"  note: several objects look like the human ({[sim.getObjectAlias(h, 1) for h in tops]}); using the first. "
+                  f"Pass --human NAME to choose.")
+
+        def volume(h):
+            bb = self._local_bbox(h)
+            return (bb[3] - bb[0]) * (bb[4] - bb[1]) * (bb[5] - bb[2])
+        shapes = sorted(sim.getObjectsInTree(self.human, sim.object_shape_type, 0), key=volume, reverse=True)
+        pts = []
+        for h in [self.human] + shapes[:3]:                                  # the root plus his 3 biggest shapes
+            if h not in pts:
+                pts.append(h)
+        self.human_points = pts
+        print(f"  human sensor: tracking '{sim.getObjectAlias(self.human, 1)}' ({len(pts)} points); the arm retracts if he "
+              f"gets within {HUMAN_STOP_RADIUS:.2f} m of it")
 
     def discover(self):
         sim = self.sim
@@ -324,6 +433,9 @@ class Robot:
               f"GrabPoint_Barrel={sim.getObjectAlias(self.grab_barrel, 1)}  "
               f"PointB={sim.getObjectAlias(self.point_b, 1)}  barrel={sim.getObjectAlias(self.barrel, 1)}")
         print(f"UR5 joints found: {len(self.joints)}   barrel long axis: local {'XYZ'[self.barrel_axis_index]}")
+        if self.human is not None:
+            print(f"Human: {sim.getObjectAlias(self.human, 1)}  tracked via {[sim.getObjectAlias(h, 0) for h in self.human_points]}  "
+                  f"distance to arm right now {self.human_distance():.2f} m (stop radius {HUMAN_STOP_RADIUS:.2f} m)")
 
     # ---------- small geometry helpers ----------
     def _local_bbox(self, obj):
@@ -360,6 +472,73 @@ class Robot:
     def step(self, n=1):
         for _ in range(n):
             self.sim.step()
+            if self.guard_on and not self._guarding:
+                self._guard()
+
+    # ---------- human safety ----------
+    def arm_points(self):
+        """Everything on the robot a person could be hurt by: every UR5 joint, the tool point, the held barrel."""
+        pts = list(self.joints) + [self.grab_ur5]
+        if self.barrel_held:
+            pts.append(self.barrel)
+        return pts
+
+    def human_distance(self):
+        """Horizontal distance (m) from the human to the nearest point of the arm. inf if there is no human."""
+        if not self.human_points:
+            return float("inf")
+        return min_pair_distance([self.pos(h) for h in self.human_points], [self.pos(h) for h in self.arm_points()])
+
+    def _joint_targets(self, qs):
+        for j, q in zip(self.joints, qs):
+            self.sim.setJointTargetPosition(j, q)
+
+    def _guard(self):
+        """Runs after every sim step while a run is active: read the sensor, react if the human is too close."""
+        self._guard_tick += 1
+        if self._guard_tick % HUMAN_CHECK_EVERY:
+            return
+        if self.human_sensor.update(self.human_distance()):
+            self._respond_to_human()
+
+    def _respond_to_human(self):
+        """
+        Wheels off, UR5 joints straight back to the start pose (direct joint targets, so no IK solve can fail),
+        wait for the human to leave, ease the arm back to where it was, and hand control back to the interrupted move.
+        """
+        sim = self.sim
+        self._guarding = True
+        try:
+            self.human_trips += 1
+            resume_q = [sim.getJointPosition(j) for j in self.joints]
+            print(f"  !! HUMAN NEAR ({self.human_distance():.2f} m from the arm): wheels stopped, retracting the arm")
+            while True:
+                self._set_wheels([0.0] * 4)
+                self._joint_targets(self.joint_start)                           # retract NOW
+                waited = 0
+                while self.human_sensor.near:
+                    sim.step()
+                    waited += 1
+                    if waited > HUMAN_MAX_WAIT_STEPS:
+                        raise HumanTooClose(f"human stayed within {HUMAN_STOP_RADIUS:.2f} m of the arm for "
+                                            f"{HUMAN_MAX_WAIT_STEPS} sim steps; giving up with the arm retracted.")
+                    self.human_sensor.update(self.human_distance())
+                print("  human is clear: easing the arm back out and resuming")
+                interrupted = False
+                for i in range(1, HUMAN_RESUME_STEPS + 1):
+                    t = i / HUMAN_RESUME_STEPS
+                    self._joint_targets([a + t * (b - a) for a, b in zip(self.joint_start, resume_q)])
+                    sim.step()
+                    if self.human_sensor.update(self.human_distance()):
+                        print("  human came back: retracting again")
+                        interrupted = True
+                        break
+                if not interrupted:
+                    break
+            sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
+            self.guard_intervened = True
+        finally:
+            self._guarding = False
 
     # ---------- simulation lifecycle ----------
     def begin_run(self, near_barrel):
@@ -389,8 +568,12 @@ class Robot:
         self.step(30)
         self._build_ik()
         self.heading0 = self.platform_yaw()      # heading to hold while driving
+        self.human_sensor.reset()                # the human watch is only on while the run is in progress
+        self._guard_tick = 0
+        self.guard_on = self.human is not None
 
     def end_run(self):
+        self.guard_on = False
         try:
             if self.ik_env is not None:
                 self.simIK.eraseEnvironment(self.ik_env)
@@ -412,6 +595,7 @@ class Robot:
 
     def _restore_barrel(self):
         sim = self.sim
+        self.barrel_held = False
         try:
             sim.setObjectParent(self.barrel, self.barrel_start_parent, True)
             sim.setObjectPose(self.barrel, -1, self.barrel_start_pose)
@@ -484,12 +668,14 @@ class Robot:
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_static, 1)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, 0)
         sim.setObjectParent(self.barrel, self.grab_ur5, True)
+        self.barrel_held = True
         self.step(10)
         gap = vnorm(vsub(self.pos(self.grab_barrel), self.pos(self.grab_ur5)))
         return gap
 
     def release_barrel(self):
         sim = self.sim
+        self.barrel_held = False
         sim.setObjectParent(self.barrel, -1, True)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, self.barrel_respond0 or 1)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_static, 0)
@@ -920,6 +1106,9 @@ class Robot:
                 c = [x * WHEEL_MAX / peak for x in c]
             self._set_wheels(c)
             self.step()
+            if self.guard_intervened:                                             # we sat still for the human: that is not a stall
+                self.guard_intervened = False
+                anchor, commanded = self.pos(self.ur5)[:2], 0.0
             commanded += speed * dt
             if BUMP_STOP and n % BUMP_CHECK_EVERY == 0:
                 hit = self.check_bump()
@@ -1035,20 +1224,35 @@ def run_full(robot):
 
 
 #### MAIN
+def attempt(stage_fn, robot):
+    """Run one stage; a human who never leaves counts as a FAIL instead of crashing the whole script."""
+    try:
+        return stage_fn(robot)
+    except HumanTooClose as exc:
+        print(f"  ABORTED: {exc}")
+        return False
+
+
 def main():
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
     ap.add_argument("--repeat", type=int, default=1, help="how many times to repeat the chosen mode")
     ap.add_argument("--discover", action="store_true", help="list dummies/shapes and what was resolved, then exit")
     ap.add_argument("--standoff", type=float, default=None, help="UR5-base-to-barrel distance when parked (m)")
+    ap.add_argument("--human", default=None, help="alias (or part of it) of the walking human; default: look for bill/human/person")
+    ap.add_argument("--human-radius", type=float, default=None,
+                    help=f"retract the arm when the human is closer than this to any part of it (m, default {HUMAN_STOP_RADIUS})")
+    ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     args = ap.parse_args()
 
-    global ARM_STANDOFF
     if args.standoff is not None:
         ARM_STANDOFF = args.standoff
+    if args.human_radius is not None:
+        HUMAN_STOP_RADIUS = args.human_radius
 
-    robot = Robot()
+    robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor)
     robot.scene_summary()
     if args.discover:
         robot.discover()
@@ -1058,13 +1262,15 @@ def main():
     for n in range(1, args.repeat + 1):
         print(f"\n######## Run {n} of {args.repeat} ########")
         if args.mode in ("ur5", "all"):
-            results.append(("ur5", n, run_ur5_only(robot)))
+            results.append(("ur5", n, attempt(run_ur5_only, robot)))
         if args.mode in ("full", "all"):
-            results.append(("full", n, run_full(robot)))
+            results.append(("full", n, attempt(run_full, robot)))
 
     print("\n######## Summary ########")
     for mode, n, ok in results:
         print(f"  run {n} {mode:5s}: {'PASS' if ok else 'FAIL'}")
+    if robot.human is not None:
+        print(f"  human-proximity stops: {robot.human_trips}")
     return 0 if all(ok for _, _, ok in results) else 1
 
 
