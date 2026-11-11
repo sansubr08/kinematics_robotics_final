@@ -46,7 +46,10 @@ NOTES:
       HUMAN_CLEAR_MARGIN for a while, the arm eases back out and the interrupted move carries on. If the
       human never leaves (HUMAN_MAX_WAIT_STEPS) the run is aborted and counted as FAIL.
       The human's position is read from the model's base and its largest shapes, so it works whichever of
-      them the walking script moves.
+      them the walking script moves. The robot side of the distance is every arm point, the held barrel AND the
+      edge of the platform chassis, so the wheels also stop for a human walking up to the body.
+    - The human is NOT part of the static obstacle list used by the bump checker / parking-spot search (that list
+      is frozen at start-up, which is wrong for someone who walks); the proximity sensor tracks him live instead.
 """
 
 
@@ -268,6 +271,12 @@ def min_pair_distance(pts_a, pts_b):
                 best = d
     return best
 
+def point_box_distance(p, lo, hi):
+    """Horizontal (xy) distance from point p to the box lo..hi; 0 if p is over the box."""
+    dx = max(lo[0] - p[0], 0.0, p[0] - hi[0])
+    dy = max(lo[1] - p[1], 0.0, p[1] - hi[1])
+    return math.hypot(dx, dy)
+
 class HumanTooClose(RuntimeError):
     """The human stayed inside the stop radius for longer than HUMAN_MAX_WAIT_STEPS."""
 
@@ -385,8 +394,8 @@ class Robot:
         self.barrel_static0      = sim.getObjectInt32Param(self.barrel, sim.shapeintparam_static)
         self.barrel_respond0     = sim.getObjectInt32Param(self.barrel, sim.shapeintparam_respondable)
         self.floor_z             = self.world_min_z(self.barrel)
+        self._resolve_human()                # before the bump monitor: it must know which shapes are the human
         self._build_bump_monitor()
-        self._resolve_human()
 
     def _resolve_human(self):
         """Find the walking human (the topmost object whose alias matches) and the handles that track where he is."""
@@ -484,10 +493,18 @@ class Robot:
         return pts
 
     def human_distance(self):
-        """Horizontal distance (m) from the human to the nearest point of the arm. inf if there is no human."""
+        """
+        Horizontal distance (m) from the human to the nearest part of the robot: any arm point, the held barrel,
+        or the edge of the platform chassis (so he is also caught walking up to the body). inf if there is no human.
+        """
         if not self.human_points:
             return float("inf")
-        return min_pair_distance([self.pos(h) for h in self.human_points], [self.pos(h) for h in self.arm_points()])
+        human = [self.pos(h) for h in self.human_points]
+        d = min_pair_distance(human, [self.pos(h) for h in self.arm_points()])
+        if self.bump_body:
+            lo, hi = self.body_box()
+            d = min(d, min(point_box_distance(p, lo, hi) for p in human))
+        return d
 
     def _joint_targets(self, qs):
         for j, q in zip(self.joints, qs):
@@ -796,9 +813,16 @@ class Robot:
         self.bump_body = [(h, self._local_bbox(h)) for h in body[:4]]      # the chassis is the big one
 
         ignore = {norm_name(n) for n in BUMP_IGNORE}
+        # The human walks, so a box frozen at his start position is wrong everywhere else. He is handled by the
+        # proximity sensor instead (it follows him every step), not by this static list.
+        human_tree = set()
+        if self.human is not None:
+            human_tree = set(sim.getObjectsInTree(self.human, shape, 0))
+            if sim.getObjectType(self.human) == shape:
+                human_tree.add(self.human)
         self.bump_obstacles = []
         for h in self._all_objects():
-            if sim.getObjectType(h) != shape or h in plat_tree or h in ur5_tree or h == self.barrel:
+            if sim.getObjectType(h) != shape or h in plat_tree or h in ur5_tree or h == self.barrel or h in human_tree:
                 continue
             alias = sim.getObjectAlias(h, 0)
             if norm_name(alias) in ignore:
