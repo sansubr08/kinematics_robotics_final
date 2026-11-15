@@ -261,6 +261,150 @@ def standoff_goal(barrel_xy, from_xy, standoff):
         d = [-1.0, 0.0]
     return vadd(barrel_xy, vscale(d, standoff))
 
+#### BUILT-IN IK (used when CoppeliaSim's simIK plugin cannot be loaded, or with --builtin-ik)
+def mat_mul(A, B):
+    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+def mat_vec(A, v):
+    return [sum(A[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+def mat_T(A):
+    return [[A[j][i] for j in range(3)] for i in range(3)]
+
+def quat_to_mat(q):
+    """3x3 rotation matrix of a quaternion [x, y, z, w]."""
+    n = math.sqrt(sum(c * c for c in q)) or 1.0
+    x, y, z, w = (c / n for c in q)
+    return [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+
+def axis_angle_mat(axis, angle):
+    """Rotation matrix for a turn of `angle` about `axis` (Rodrigues)."""
+    ux, uy, uz = vunit(axis)
+    c, s = math.cos(angle), math.sin(angle)
+    k = 1.0 - c
+    return [[c + ux * ux * k, ux * uy * k - uz * s, ux * uz * k + uy * s],
+            [uy * ux * k + uz * s, c + uy * uy * k, uy * uz * k - ux * s],
+            [uz * ux * k - uy * s, uz * uy * k + ux * s, c + uz * uz * k]]
+
+def mat_to_rotvec(R):
+    """Rotation vector (axis * angle, angle in [0, pi]) of a rotation matrix."""
+    cos_a = max(-1.0, min(1.0, (R[0][0] + R[1][1] + R[2][2] - 1.0) / 2.0))
+    angle = math.acos(cos_a)
+    if angle < 1e-9:
+        return [0.0, 0.0, 0.0]
+    if math.pi - angle < 1e-4:                    # near 180 deg sin(angle) ~ 0, so read the axis off the diagonal
+        k = max(range(3), key=lambda i: R[i][i])
+        a = [0.0, 0.0, 0.0]
+        a[k] = math.sqrt(max(0.0, (R[k][k] + 1.0) / 2.0))
+        for j in range(3):
+            if j != k:
+                a[j] = (R[k][j] + R[j][k]) / (4.0 * a[k]) if a[k] > 1e-9 else 0.0
+        return vscale(vunit(a), angle)
+    f = angle / (2.0 * math.sin(angle))
+    return vscale([R[2][1] - R[1][2], R[0][2] - R[2][0], R[1][0] - R[0][1]], f)
+
+def solve_linear(A, b):
+    """Solve A x = b by Gaussian elimination with partial pivoting. Returns None if A is singular."""
+    n = len(b)
+    M = [list(A[i]) + [b[i]] for i in range(n)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[p][c]) < 1e-12:
+            return None
+        M[c], M[p] = M[p], M[c]
+        for r in range(c + 1, n):
+            f = M[r][c] / M[c][c]
+            if f:
+                for k in range(c, n + 1):
+                    M[r][k] -= f * M[c][k]
+    x = [0.0] * n
+    for r in range(n - 1, -1, -1):
+        x[r] = (M[r][n] - sum(M[r][k] * x[k] for k in range(r + 1, n))) / M[r][r]
+    return x
+
+class ScrewChain:
+    """
+    Forward kinematics and damped-least-squares IK for a serial chain of revolute joints, described by where
+    each joint axis sits when the arm is in the snapshot configuration q0 (product-of-exponentials model).
+    Everything is expressed in the chain's BASE frame, so the platform driving around does not matter.
+
+        axes[i], points[i]   unit axis and a point on it for joint i, in the base frame, at q0
+        tool_pose            tool pose [x, y, z, qx, qy, qz, qw] in the base frame, at q0
+        limits[i]            (lo, hi) in rad, or None for a joint without limits
+    """
+    def __init__(self, axes, points, q0, tool_pose, limits=None):
+        self.n = len(axes)
+        self.axes = [vunit(a) for a in axes]
+        self.points = [list(p) for p in points]
+        self.q0 = list(q0)
+        self.R0 = quat_to_mat(tool_pose[3:])
+        self.p0 = list(tool_pose[:3])
+        self.limits = list(limits) if limits else [None] * self.n
+
+    def _frames(self, q):
+        R = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        t = [0.0, 0.0, 0.0]
+        axes_w, points_w = [], []
+        for i in range(self.n):
+            axes_w.append(mat_vec(R, self.axes[i]))                       # joint i as it sits for this q
+            points_w.append(vadd(mat_vec(R, self.points[i]), t))
+            Ri = axis_angle_mat(self.axes[i], q[i] - self.q0[i])
+            ti = vsub(self.points[i], mat_vec(Ri, self.points[i]))        # a turn about an axis that does not pass through 0
+            t = vadd(mat_vec(R, ti), t)
+            R = mat_mul(R, Ri)
+        return R, t, axes_w, points_w
+
+    def fk(self, q):
+        """(R, p): tool rotation matrix and position in the base frame for joint angles q."""
+        R, t, _, _ = self._frames(q)
+        return mat_mul(R, self.R0), vadd(mat_vec(R, self.p0), t)
+
+    def jacobian(self, q):
+        """6 x n geometric Jacobian: rows 0-2 tool velocity, rows 3-5 angular velocity, per unit joint speed."""
+        R, t, axes_w, points_w = self._frames(q)
+        tool = vadd(mat_vec(R, self.p0), t)
+        cols = [vcross(axes_w[i], vsub(tool, points_w[i])) + axes_w[i] for i in range(self.n)]
+        return [[cols[k][r] for k in range(self.n)] for r in range(6)]
+
+    def pose_error(self, q, target_R, target_p):
+        R, p = self.fk(q)
+        return vsub(target_p, p), mat_to_rotvec(mat_mul(target_R, mat_T(R)))
+
+    def solve(self, q_start, target_R, target_p, max_iter=99, damping=0.1,
+              tol_pos=5e-4, tol_ang=5e-3, max_step=0.3):
+        """
+        Damped least squares from q_start toward the target pose (matrix + position, base frame).
+        Returns (q, converged, position error m, orientation error rad). Always returns the best joint
+        angles it reached, so an out-of-reach target still moves the arm as close as it can get.
+        """
+        q = list(q_start)
+        for _ in range(max_iter):
+            e_pos, e_rot = self.pose_error(q, target_R, target_p)
+            ep, ea = vnorm(e_pos), vnorm(e_rot)
+            if ep < tol_pos and ea < tol_ang:
+                return q, True, ep, ea
+            J = self.jacobian(q)
+            e = e_pos + e_rot
+            A = [[sum(J[i][k] * J[j][k] for k in range(self.n)) + (damping * damping if i == j else 0.0)
+                  for j in range(6)] for i in range(6)]
+            y = solve_linear(A, e)                                        # dq = J^T (J J^T + damping^2 I)^-1 e
+            if y is None:
+                break
+            dq = [sum(J[r][k] * y[r] for r in range(6)) for k in range(self.n)]
+            big = max(abs(x) for x in dq)
+            if big > max_step:                                            # never swing a joint wildly in one iteration
+                dq = [x * max_step / big for x in dq]
+            q = [q[k] + dq[k] for k in range(self.n)]
+            for k, lim in enumerate(self.limits):
+                if lim is not None:
+                    q[k] = min(lim[1], max(lim[0], q[k]))
+        e_pos, e_rot = self.pose_error(q, target_R, target_p)
+        ep, ea = vnorm(e_pos), vnorm(e_rot)
+        return q, (ep < tol_pos and ea < tol_ang), ep, ea
+
+
 def min_pair_distance(pts_a, pts_b):
     """Smallest horizontal (xy) distance between any point of pts_a and any point of pts_b."""
     best = float("inf")
@@ -316,11 +460,23 @@ class ProximitySensor:
 class Robot:
     """Everything that talks to CoppeliaSim lives in here."""
 
-    def __init__(self, human_name=None, use_human_sensor=True):
+    def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
         self.sim    = self.client.require("sim")
-        self.simIK  = self.client.require("simIK")
+        self.simIK  = None
+        self.arm_ik = None                 # ScrewChain, used instead of simIK when the plugin is unavailable
+        self.ik_chain = []
+        if force_builtin_ik:
+            print("IK: using the built-in solver (--builtin-ik).")
+        else:
+            try:
+                self.simIK = self.client.require("simIK")
+            except Exception as exc:
+                msg = str(exc).strip().splitlines()[-1] if str(exc).strip() else type(exc).__name__
+                print(f"IK: CoppeliaSim's simIK plugin could not be loaded ({msg}).")
+                print("    Falling back to the built-in IK solver; everything else works the same.")
+                self.simIK = None
         self.ik_env = self.ik_group = self.ik_target = None
         self.A = None                      # wheel response matrix, filled in once by calibrate_once()
         self.floor_box = None
@@ -592,7 +748,7 @@ class Robot:
     def end_run(self):
         self.guard_on = False
         try:
-            if self.ik_env is not None:
+            if self.ik_env is not None and self.simIK is not None:
                 self.simIK.eraseEnvironment(self.ik_env)
         except Exception:
             pass
@@ -602,6 +758,7 @@ class Robot:
         except Exception:
             pass
         self.ik_env = self.ik_group = self.ik_target = None
+        self.arm_ik = None
         for w in self.wheels:
             try:
                 self.sim.setJointTargetVelocity(w, 0.0)
@@ -622,11 +779,41 @@ class Robot:
             print(f"  (could not fully restore the barrel: {exc})")
 
     # ---------- IK ----------
+    def _build_builtin_ik(self):
+        """Read the arm's geometry from the scene once (joint axes, tool pose, limits), in the arm base frame."""
+        sim = self.sim
+        chain, h = [], self.grab_ur5
+        while h != -1 and h != self.ur5:
+            if sim.getObjectType(h) == sim.object_joint_type:
+                chain.append(h)
+            h = sim.getObjectParent(h)
+        chain.reverse()                                            # base -> tip
+        if not chain:
+            raise RuntimeError("built-in IK: found no joints between the UR5 base and GrabPoint_UR5")
+        axes, points, q0, limits = [], [], [], []
+        for j in chain:
+            jp = sim.getObjectPose(j, self.ur5)
+            R = quat_to_mat(jp[3:])
+            axes.append([R[0][2], R[1][2], R[2][2]])               # a CoppeliaSim joint turns about its local Z
+            points.append(list(jp[:3]))
+            q0.append(sim.getJointPosition(j))
+            try:
+                cyclic, (lo, rng) = sim.getJointInterval(j)
+                limits.append(None if cyclic else (lo, lo + rng))
+            except Exception:
+                limits.append(None)
+        self.ik_chain = chain
+        self.arm_ik = ScrewChain(axes, points, q0, sim.getObjectPose(self.grab_ur5, self.ur5), limits)
+        print(f"IK: built-in solver ready ({len(chain)} joints).")
+
     def _build_ik(self):
         sim, simIK = self.sim, self.simIK
         self.ik_target = sim.createDummy(0.02)
         sim.setObjectAlias(self.ik_target, "barrel_task_ik_target")
         sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))
+        if simIK is None:
+            self._build_builtin_ik()
+            return
         self.ik_env = simIK.createEnvironment()
         self.ik_group = simIK.createGroup(self.ik_env)
         simIK.setGroupCalculation(self.ik_env, self.ik_group, simIK.method_damped_least_squares, 0.1, 99)
@@ -637,8 +824,22 @@ class Robot:
                            | simIK.constraint_alpha_beta | simIK.constraint_gamma)
         simIK.addElementFromScene(self.ik_env, self.ik_group, self.ur5, self.grab_ur5, self.ik_target, constraints)
 
+    def _ik_to_builtin(self, pose):
+        sim = self.sim
+        base = sim.getObjectPose(self.ur5, -1)
+        Rb_T = mat_T(quat_to_mat(base[3:]))                        # world -> arm base frame
+        target_p = mat_vec(Rb_T, vsub(list(pose[:3]), base[:3]))
+        target_R = mat_mul(Rb_T, quat_to_mat(list(pose[3:])))
+        q_now = [sim.getJointPosition(j) for j in self.ik_chain]
+        q, ok, _, _ = self.arm_ik.solve(q_now, target_R, target_p)
+        for j, qi in zip(self.ik_chain, q):
+            sim.setJointTargetPosition(j, qi)
+        return ok
+
     def _ik_to(self, pose):
         self.sim.setObjectPose(self.ik_target, -1, pose)
+        if self.simIK is None:
+            return self._ik_to_builtin(pose)
         res = self.simIK.handleGroup(self.ik_env, self.ik_group, {"syncWorlds": True})
         code = res[0] if isinstance(res, (tuple, list)) else res
         return code == self.simIK.result_success
@@ -1268,6 +1469,7 @@ def main():
     ap.add_argument("--human", default=None, help="alias (or part of it) of the walking human; default: look for bill/human/person")
     ap.add_argument("--human-radius", type=float, default=None,
                     help=f"retract the arm when the human is closer than this to any part of it (m, default {HUMAN_STOP_RADIUS})")
+    ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     args = ap.parse_args()
 
@@ -1276,7 +1478,8 @@ def main():
     if args.human_radius is not None:
         HUMAN_STOP_RADIUS = args.human_radius
 
-    robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor)
+    robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor,
+                  force_builtin_ik=args.builtin_ik)
     robot.scene_summary()
     if args.discover:
         robot.discover()
