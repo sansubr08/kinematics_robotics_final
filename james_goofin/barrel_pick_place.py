@@ -8,7 +8,8 @@ Description: Barrel pick-and-place with the OmniPlatform + UR5 in CoppeliaSim
         2. UR5 rotates the glued barrel so it lies sideways (barrel axis horizontal).
         3. Start over. This time the OmniPlatform drives from its starting position to the
            barrel, and the UR5 grabs it (same as stage 1).
-        4. OmniPlatform drives to PointB, the UR5 turns the barrel sideways (same as stage 2),
+        4. OmniPlatform drives to the white box (the whitest solid shape; --place-on pointb uses the PointB
+           dummy instead), the UR5 turns the barrel sideways (same as stage 2),
            lowers it to the floor and lets go.
         5. Repeat 1-4 several times with no problems (scene is restored between runs).
 
@@ -121,6 +122,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
+PLACE_ON         = "white"               # where to set the barrel: "white" = the white box, "pointb" = the PointB dummy, or part of a shape's name
 PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
 
 # --- human safety (proximity sensor -> retract the arm) ---
@@ -1022,6 +1024,7 @@ class Robot:
             if sim.getObjectType(self.human) == shape:
                 human_tree.add(self.human)
         self.bump_obstacles = []
+        self.bump_handles = []                                            # same order as bump_obstacles
         for h in self._all_objects():
             if sim.getObjectType(h) != shape or h in plat_tree or h in ur5_tree or h == self.barrel or h in human_tree:
                 continue
@@ -1046,6 +1049,7 @@ class Robot:
                 print(f"  note: ignoring room-sized shape '{alias}' as an obstacle")
                 continue
             self.bump_obstacles.append((alias, lo, hi))
+            self.bump_handles.append(h)
         self.bump_baseline = {}
 
     def body_box(self):
@@ -1121,6 +1125,28 @@ class Robot:
         print(f"  warning: no obstacle-free parking spot found within {PARK_MAX_DIST} m of "
               f"({target_xy[0]:.2f}, {target_xy[1]:.2f}); parking {min_d:.2f} m away anyway.")
         return vadd(target_xy, vscale(u, min_d)), min_d
+
+    def find_place_box(self, name=None):
+        """
+        The box the barrel should end up on: the obstacle whose name contains `name`, or (default) the whitest
+        solid shape in the scene. Returns (alias, lo, hi) or None.
+        """
+        sim = self.sim
+        if name:
+            key = norm_name(name)
+            hits = [o for o in self.bump_obstacles if key in norm_name(o[0])]
+            return max(hits, key=lambda o: (o[2][0] - o[1][0]) * (o[2][1] - o[1][1])) if hits else None
+        best, best_w = None, 0.0
+        for obs, h in zip(self.bump_obstacles, self.bump_handles):
+            try:
+                rgb = sim.getShapeColor(h, None, getattr(sim, "colorcomponent_ambient_diffuse", 0))
+                rgb = rgb[0] if isinstance(rgb[0], (list, tuple)) else rgb
+                w = min(rgb[:3])
+            except Exception:
+                continue
+            if w > best_w:
+                best, best_w = obs, w
+        return best if best_w >= 0.8 else None
 
     def surface_z_at(self, xy, fallback_z):
         """Height of the top of whatever solid object is under xy (the white block), else fallback_z."""
@@ -1408,10 +1434,20 @@ def run_full(robot):
         # Where the barrel goes: park on the side we arrive from, clear of every solid object (the platform never
         # touches the blocks), as close to PointB as that allows, and set the barrel down ON the surface at PointB.
         b_xy = robot.pos(robot.point_b)[:2]
+        b_z = robot.pos(robot.point_b)[2]
+        if PLACE_ON != "pointb":
+            box = robot.find_place_box(None if PLACE_ON == "white" else PLACE_ON)
+            if box is not None:
+                name, lo, hi = box
+                b_xy = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0]
+                b_z = hi[2]
+                print(f"  placing ON '{name}' (centre {b_xy[0]:.2f}, {b_xy[1]:.2f}, top z {hi[2]:.3f} m)")
+            else:
+                print("  warning: could not find the white box (or the --place-on name); using PointB instead.")
         cur_xy = robot.pos(robot.ur5)[:2]
         ur5_goal, _ = robot.park_spot(b_xy, cur_xy, MIN_PARK_DIST)
         place_xy = b_xy
-        surface_z, src = robot.surface_z_at(b_xy, robot.pos(robot.point_b)[2])
+        surface_z, src = robot.surface_z_at(b_xy, b_z)
         print(f"  PointB is on {'the top of ' + repr(src) if src else 'the floor'} (surface z = {surface_z:.3f} m)")
 
         # Turn around NOW, while standing still: lift clear of the white block's height, then swing the arm round so
@@ -1459,7 +1495,7 @@ def attempt(stage_fn, robot):
 
 
 def main():
-    global ARM_STANDOFF, HUMAN_STOP_RADIUS
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
@@ -1469,12 +1505,16 @@ def main():
     ap.add_argument("--human", default=None, help="alias (or part of it) of the walking human; default: look for bill/human/person")
     ap.add_argument("--human-radius", type=float, default=None,
                     help=f"retract the arm when the human is closer than this to any part of it (m, default {HUMAN_STOP_RADIUS})")
+    ap.add_argument("--place-on", default=None,
+                    help="where the barrel goes: 'white' (default, the white box), 'pointb' (the PointB dummy), or part of a shape's name")
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     args = ap.parse_args()
 
     if args.standoff is not None:
         ARM_STANDOFF = args.standoff
+    if args.place_on:
+        PLACE_ON = args.place_on.lower() if args.place_on.lower() in ("white", "pointb") else args.place_on
     if args.human_radius is not None:
         HUMAN_STOP_RADIUS = args.human_radius
 
