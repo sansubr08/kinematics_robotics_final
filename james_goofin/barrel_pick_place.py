@@ -8,8 +8,7 @@ Description: Barrel pick-and-place with the OmniPlatform + UR5 in CoppeliaSim
         2. UR5 rotates the glued barrel so it lies sideways (barrel axis horizontal).
         3. Start over. This time the OmniPlatform drives from its starting position to the
            barrel, and the UR5 grabs it (same as stage 1).
-        4. OmniPlatform drives to the white box (the whitest solid shape; --place-on pointb uses the PointB
-           dummy instead), the UR5 turns the barrel sideways (same as stage 2),
+        4. OmniPlatform drives to PointB (the white box; --place-on NAME picks another shape), the UR5 turns the barrel sideways (same as stage 2),
            lowers it to the floor and lets go.
         5. Repeat 1-4 several times with no problems (scene is restored between runs).
 
@@ -122,7 +121,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
-PLACE_ON         = "white"               # where to set the barrel: "white" = the white box, "pointb" = the PointB dummy, or part of a shape's name
+PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
 PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
 
 # --- human safety (proximity sensor -> retract the arm) ---
@@ -1506,7 +1505,7 @@ def main():
     ap.add_argument("--human-radius", type=float, default=None,
                     help=f"retract the arm when the human is closer than this to any part of it (m, default {HUMAN_STOP_RADIUS})")
     ap.add_argument("--place-on", default=None,
-                    help="where the barrel goes: 'white' (default, the white box), 'pointb' (the PointB dummy), or part of a shape's name")
+                    help="where the barrel goes: 'pointb' (default: on PointB, the white box), 'white' (whitest shape), or part of a shape's name")
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     args = ap.parse_args()
