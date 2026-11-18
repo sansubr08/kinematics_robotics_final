@@ -706,6 +706,9 @@ class Robot:
                         raise HumanTooClose(f"human stayed within {HUMAN_STOP_RADIUS:.2f} m of the arm for "
                                             f"{HUMAN_MAX_WAIT_STEPS} sim steps; giving up with the arm retracted.")
                     self.human_sensor.update(self.human_distance())
+                    if waited % 200 == 0:
+                        print(f"    ...still waiting: human is {self.human_distance():.2f} m away "
+                              f"(needs > {HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN:.2f} m for {HUMAN_CLEAR_CHECKS} readings in a row)")
                 print("  human is clear: easing the arm back out and resuming")
                 interrupted = False
                 for i in range(1, HUMAN_RESUME_STEPS + 1):
@@ -729,6 +732,7 @@ class Robot:
                 if not interrupted:
                     break
             sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
+            print("  arm is back where it was; carrying on with the move")
             self.guard_intervened = True
         finally:
             self._guarding = False
