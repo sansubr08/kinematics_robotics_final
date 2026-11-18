@@ -567,6 +567,13 @@ class Robot:
         robot_tree = set(sim.getObjectsInTree(self.platform, sim.handle_all, 0)) | {self.platform}
         tops = [h for h in hits if sim.getObjectParent(h) not in hit_set     # the model root, not its body parts
                 and h not in robot_tree and h != self.barrel]
+        # The scene also holds marker dummies such as BillSpot_1..3 (test positions for Bill) whose names contain "bill".
+        # They are not people: a real human model has shapes in its tree, a marker dummy has none. Keep only the former,
+        # and put an exact name match ("Bill") ahead of the rest, then the model with the most shapes.
+        def n_shapes(h):
+            return len(sim.getObjectsInTree(h, sim.object_shape_type, 0)) + (1 if sim.getObjectType(h) == sim.object_shape_type else 0)
+        tops = [h for h in tops if n_shapes(h) > 0]
+        tops.sort(key=lambda h: (norm_name(sim.getObjectAlias(h, 0)) not in hints, -n_shapes(h)))
         if not tops:
             raise RuntimeError(f"Could not find the human (looked for an alias containing {hints}). Run with --discover to "
                                f"see what is in the scene, then pass --human NAME, or use --no-human-sensor to run without it.")
