@@ -130,6 +130,7 @@ HUMAN_STOP_RADIUS    = 0.8     # m, a human closer than this to ANY part of the 
 HUMAN_CLEAR_MARGIN   = 0.2     # m, the human must get this much farther than the stop radius to count as clear
 HUMAN_CLEAR_CHECKS   = 5      # consecutive sensor readings the human must stay clear before the arm goes back out
 HUMAN_CHECK_EVERY    = 2       # sim steps between sensor readings
+HUMAN_SETTLE_STEPS   = 60      # extra sim steps allowed for the joints to arrive at the resume pose before IK takes over
 HUMAN_RESUME_STEPS   = 25      # sim steps taken to re-extend the arm after the human has left
 HUMAN_MAX_WAIT_STEPS = 2400    # sim steps to wait for the human to leave before giving up (the run is then aborted)
 
@@ -714,6 +715,16 @@ class Robot:
                         print("  human came back: retracting again")
                         interrupted = True
                         break
+                if not interrupted:                                             # let the joints really arrive before IK resumes
+                    for _ in range(HUMAN_SETTLE_STEPS):
+                        if max(abs(sim.getJointPosition(j) - q) for j, q in zip(self.joints, resume_q)) < 0.01:
+                            break
+                        self._joint_targets(resume_q)
+                        sim.step()
+                        if self.human_sensor.update(self.human_distance()):
+                            print("  human came back: retracting again")
+                            interrupted = True
+                            break
                 if not interrupted:
                     break
             sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
@@ -1344,7 +1355,7 @@ class Robot:
         dt = self.sim.getSimulationTimeStep()
         self.blocked = False
         self.bump_baseline = {}
-        anchor, commanded = self.pos(self.ur5)[:2], 0.0           # progress bookkeeping for contact detection
+        anchor, commanded, anchor_n = self.pos(self.ur5)[:2], 0.0, 0   # progress bookkeeping for contact detection
         for n in range(DRIVE_MAX_STEPS):
             p = self.pos(self.ur5)[:2]
             err = vsub(goal_xy, p)
@@ -1365,7 +1376,7 @@ class Robot:
             self.step()
             if self.guard_intervened:                                             # we sat still for the human: that is not a stall
                 self.guard_intervened = False
-                anchor, commanded = self.pos(self.ur5)[:2], 0.0
+                anchor, commanded, anchor_n = self.pos(self.ur5)[:2], 0.0, n + 1
             commanded += speed * dt
             if BUMP_STOP and n % BUMP_CHECK_EVERY == 0:
                 hit = self.check_bump()
@@ -1380,15 +1391,15 @@ class Robot:
                 near_txt = f", nearest solid '{near}' {gap * 1000:.0f} mm" if near is not None and gap < 5.0 else ""
                 print(f"    t={n:4d}  {dist * 1000:5.0f} mm to go, heading off by {math.degrees(yaw_err):+5.1f} deg{near_txt}")
 
-            if STOP_ON_CONTACT and (n + 1) % STALL_WINDOW == 0:
+            if STOP_ON_CONTACT and n + 1 - anchor_n >= STALL_WINDOW:              # a full window since the last reset
                 moved = vsub(self.pos(self.ur5)[:2], anchor)
                 toward = vdot(moved, vunit(err))                                  # progress toward the goal
-                if n + 1 > STALL_WINDOW and dist > 2 * tol and toward < max(STALL_MIN_M, STALL_MIN_FRAC * commanded):
+                if dist > 2 * tol and toward < max(STALL_MIN_M, STALL_MIN_FRAC * commanded):
                     self.blocked = True
                     print(f"  platform is not making progress ({dist * 1000:.0f} mm from the goal): it has run into "
                           f"something, stopping here.")
                     break
-                anchor, commanded = self.pos(self.ur5)[:2], 0.0
+                anchor, commanded, anchor_n = self.pos(self.ur5)[:2], 0.0, n + 1
         else:
             print("  (drive timed out before reaching the goal)")
         self._set_wheels([0.0] * 4)
