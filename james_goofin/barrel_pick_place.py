@@ -1232,7 +1232,7 @@ class Robot:
         cmd[i] = speed
         self._set_wheels(cmd)
         half = CAL_STEPS // 2
-        self.step(half)                                       # let the wheel spin up, discard this part
+        self._cal_step(half)                                  # let the wheel spin up, discard this part
         if i == 0 and sign > 0:
             try:                                              # is something else fighting our wheel command?
                 got = sim.getJointTargetVelocity(self.wheels[0])
@@ -1243,7 +1243,7 @@ class Robot:
             except Exception:
                 pass
         p0, y0 = self.pos(self.ur5)[:2], self.platform_yaw()
-        self.step(CAL_STEPS - half)
+        self._cal_step(CAL_STEPS - half)
         p1, y1 = self.pos(self.ur5)[:2], self.platform_yaw()
         self._set_wheels([0.0] * 4)
         self.step(CAL_SETTLE_STEPS)
@@ -1253,10 +1253,32 @@ class Robot:
         w = wrap_angle(y1 - y0) / t
         return [v_body[0] / speed, v_body[1] / speed, w / speed]
 
+    def _cal_step(self, n):
+        """Step n times; note if the walking human came near the platform (a person brushing past ruins a measurement)."""
+        for _ in range(n):
+            self.step()
+            if self.human_points and self.human_distance() < HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN:
+                self._cal_disturbed = True
+
     def _wheel_burst(self, i):
-        """Forward burst then backward burst: the platform ends up about where it began, and the two are averaged."""
-        a = self._burst_once(i, +1)
-        b = self._burst_once(i, -1)
+        """
+        Forward burst then backward burst: the platform ends up about where it began, and the two are averaged.
+        If the human walked close during either burst the measurement is thrown away: wait until he is clear, redo it.
+        """
+        for attempt in range(1, 13):
+            self._cal_disturbed = False
+            a = self._burst_once(i, +1)
+            b = self._burst_once(i, -1)
+            if not self._cal_disturbed:
+                break
+            print(f"  wheel {i}: the human walked close during the measurement; discarding it and waiting for him to clear (try {attempt})")
+            self._set_wheels([0.0] * 4)
+            for _ in range(HUMAN_MAX_WAIT_STEPS):
+                if self.human_distance() > HUMAN_STOP_RADIUS + 2 * HUMAN_CLEAR_MARGIN:
+                    break
+                self.step()
+        else:
+            print(f"  warning: wheel {i} could not be measured without the human nearby; using the last reading.")
         return [(a[k] + b[k]) / 2.0 for k in range(3)]
 
     def _find_clear_spot(self):
