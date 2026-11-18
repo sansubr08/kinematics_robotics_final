@@ -82,6 +82,7 @@ WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from th
 WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
 CAL_SCALE        = 0.7                # calibration burst speed, as a multiple of WHEEL_V
 CAL_STEPS        = 24                 # sim steps per calibration burst (one wheel at a time, forward then back)
+CAL_IN_PLACE     = True               # calibrate where the platform stands (small bursts); False = drive to a clear spot first
 CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
 CAL_SETTLE_STEPS = 40                 # sim steps to let the platform coast to a stop between bursts
 DRIVE_GAIN       = 2.0                # 1/s, P gain on position error
@@ -1316,8 +1317,10 @@ class Robot:
         sim.setObjectPose(self.platform, -1, self.platform_start_pose)
         for j, q in zip(self.joints, self.joint_start):
             sim.setJointPosition(j, q)
-        spot = self._find_clear_spot()
-        if spot is not None:
+        spot = None if CAL_IN_PLACE else self._find_clear_spot()
+        if CAL_IN_PLACE:
+            print("  calibrating in place with small bursts (CAL_IN_PLACE)")
+        elif spot is not None:
             shift = vsub(spot, self.pos(self.ur5)[:2])
             p = sim.getObjectPosition(self.platform, -1)
             sim.setObjectPosition(self.platform, -1, [p[0] + shift[0], p[1] + shift[1], p[2]])
