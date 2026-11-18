@@ -1398,6 +1398,9 @@ class Robot:
                     self.blocked = True
                     print(f"  platform is not making progress ({dist * 1000:.0f} mm from the goal): it has run into "
                           f"something, stopping here.")
+                    print(f"    diagnostics: in the last {n + 1 - anchor_n} steps it moved ({moved[0] * 1000:+.0f}, {moved[1] * 1000:+.0f}) mm "
+                          f"toward a goal at direction ({err[0]:+.2f}, {err[1]:+.2f}); nearest solid {self.nearest_obstacle()}; "
+                          f"human {self.human_distance():.2f} m from the arm")
                     break
                 anchor, commanded, anchor_n = self.pos(self.ur5)[:2], 0.0, n + 1
         else:
