@@ -128,9 +128,9 @@ PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
 HUMAN_ALIASES        = ["bill", "human", "person", "pedestrian", "walker"]   # alias substrings used to find the human (--human overrides)
 HUMAN_STOP_RADIUS    = 0.8     # m, a human closer than this to ANY part of the arm (or the held barrel) trips the sensor
 HUMAN_CLEAR_MARGIN   = 0.2     # m, the human must get this much farther than the stop radius to count as clear
-HUMAN_CLEAR_CHECKS   = 15      # consecutive sensor readings the human must stay clear before the arm goes back out
+HUMAN_CLEAR_CHECKS   = 5      # consecutive sensor readings the human must stay clear before the arm goes back out
 HUMAN_CHECK_EVERY    = 2       # sim steps between sensor readings
-HUMAN_RESUME_STEPS   = 60      # sim steps taken to re-extend the arm after the human has left
+HUMAN_RESUME_STEPS   = 25      # sim steps taken to re-extend the arm after the human has left
 HUMAN_MAX_WAIT_STEPS = 2400    # sim steps to wait for the human to leave before giving up (the run is then aborted)
 
 
