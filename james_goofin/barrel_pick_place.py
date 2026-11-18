@@ -82,6 +82,7 @@ WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from th
 WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
 CAL_SCALE        = 0.7                # calibration burst speed, as a multiple of WHEEL_V
 CAL_STEPS        = 24                 # sim steps per calibration burst (one wheel at a time, forward then back)
+REPLY_TIMEOUT_S  = 90                 # s, give up if CoppeliaSim does not answer a call for this long (a hang, not a slow step)
 CAL_IN_PLACE     = True               # calibrate where the platform stands (small bursts); False = drive to a clear spot first
 CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
 CAL_SETTLE_STEPS = 40                 # sim steps to let the platform coast to a stop between bursts
@@ -466,6 +467,11 @@ class Robot:
     def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
+        try:                                              # never hang forever on a CoppeliaSim that has stopped answering
+            import zmq
+            self.client.socket.setsockopt(zmq.RCVTIMEO, REPLY_TIMEOUT_S * 1000)
+        except Exception:
+            pass
         self.sim    = self.client.require("sim")
         self.simIK  = None
         self.arm_ik = None                 # ScrewChain, used instead of simIK when the plugin is unavailable
@@ -1591,4 +1597,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        if type(exc).__name__ == "Again":                 # zmq.Again = our receive timeout
+            print(f"\nCoppeliaSim did not answer for {REPLY_TIMEOUT_S} s, so the script stopped instead of hanging.\n"
+                  f"Look at the CoppeliaSim window: is a dialog box or error message open, is the simulation paused,\n"
+                  f"or does the console at the bottom show a Lua error (for example from Bill's script)?")
+            sys.exit(2)
+        raise
