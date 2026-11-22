@@ -151,6 +151,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
+IK_RESET_AFTER_STOP = True            # rebuild the IK world after a human stop; --no-ik-reset turns this off (to test if it misbehaves)
 ROTATE_LIFT      = 0.0     # m, raise the held barrel this much while turning it sideways (more room for the wrist); --rotate-lift
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
@@ -915,7 +916,8 @@ class Robot:
                 if not interrupted:
                     break
             sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
-            self.reset_ik()
+            if IK_RESET_AFTER_STOP:
+                self.reset_ik()
             print("  arm is back where it was; carrying on with the move")
             self.guard_intervened = True
         finally:
@@ -1768,7 +1770,7 @@ def attempt(stage_fn, robot):
 
 
 def main():
-    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT, IK_RESET_AFTER_STOP
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
@@ -1784,6 +1786,8 @@ def main():
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     ap.add_argument("--sim-human", action="store_true",
                     help="walk the scene's Bill (his own script switched off) back and forth at a speed you choose")
+    ap.add_argument("--no-ik-reset", action="store_true",
+                    help="do not rebuild the IK world after a human stop (to test whether the rebuild is what breaks the arm)")
     ap.add_argument("--rotate-lift", type=float, default=None,
                     help="raise the held barrel this many metres before turning it sideways (try 0.10-0.25 if the turn fails)")
     ap.add_argument("--cylinder-human", action="store_true",
@@ -1795,6 +1799,8 @@ def main():
                     help="ends of his walk along x (m)")
     args = ap.parse_args()
 
+    if args.no_ik_reset:
+        IK_RESET_AFTER_STOP = False
     if args.rotate_lift is not None:
         ROTATE_LIFT = args.rotate_lift
     if args.standoff is not None:
