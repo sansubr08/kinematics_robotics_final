@@ -962,6 +962,27 @@ class Robot:
         self.move_tool([t[0] + shift[0], t[1] + shift[1], t[2]] + t[3:])
         print(f"  barrel now {vnorm(vsub(self.pos(self.barrel)[:2], base)):.2f} m from the arm base")
 
+    def _report_joints(self):
+        """Where each UR5 joint is against its limits. A joint sitting on a limit is why a turn stops short."""
+        sim = self.sim
+        print("  DEBUG joints (deg): value  [limit low .. limit high]  margin to nearest limit")
+        for n, j in enumerate(self.joints, 1):
+            q = math.degrees(sim.getJointPosition(j))
+            try:
+                cyclic, (lo, rng) = sim.getJointInterval(j)
+                lo_d, hi_d = math.degrees(lo), math.degrees(lo + rng)
+                margin = min(q - lo_d, hi_d - q)
+                flag = "   <== AT LIMIT" if (not cyclic and margin < 3.0) else ("   (cyclic)" if cyclic else "")
+                print(f"    joint {n}: {q:+8.1f}  [{lo_d:+8.1f} .. {hi_d:+8.1f}]  margin {margin:7.1f}{flag}")
+            except Exception as exc:
+                print(f"    joint {n}: {q:+8.1f}  (limits unreadable: {exc})")
+        try:
+            tgt = self.sim.getObjectOrientation(self.grab_ur5, -1)
+            print("    tool orientation (deg): " + ", ".join(f"{math.degrees(a):+.0f}" for a in tgt) +
+                  f"   tool z {self.pos(self.grab_ur5)[2]:.3f} m   floor/table top {self.floor_z:.3f} m")
+        except Exception:
+            pass
+
     def rotate_sideways(self):
         """Stage 2: rotate the held barrel about the grab point until its axis is horizontal."""
         axis = self.barrel_axis_world()
@@ -986,6 +1007,8 @@ class Robot:
             self.move_tool(p[:3] + quat_mul(q_rot, p[3:]), steps=ROTATE_STEPS // 2)
             after = axis_elevation_deg(self.barrel_axis_world())
         print(f"  barrel axis now {after:.1f} deg from horizontal")
+        if after >= SIDEWAYS_TOL_DEG:
+            self._report_joints()
         return after < SIDEWAYS_TOL_DEG
 
     def lower_and_release(self, target_xy, surface_z):
