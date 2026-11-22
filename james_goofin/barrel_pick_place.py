@@ -757,6 +757,8 @@ class Robot:
             shift = vsub(goal, self.pos(self.ur5)[:2])
             p = sim.getObjectPosition(self.platform, -1)
             sim.setObjectPosition(self.platform, -1, [p[0] + shift[0], p[1] + shift[1], p[2]])
+            d = math.dist(self.pos(self.barrel)[:2], self.pos(self.ur5)[:2])
+            print(f"  parked with the UR5 base {d:.2f} m from the barrel (standoff setting {ARM_STANDOFF:.2f} m)")
 
         sim.setStepping(True)
         sim.startSimulation()
