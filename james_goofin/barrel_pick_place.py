@@ -1086,6 +1086,18 @@ class Robot:
                 break
         return err
 
+    def _explain_big_error(self, target_pose):
+        """A tool error of metres means something flew away, not that IK is hard. Say where everything is."""
+        sim = self.sim
+        f = lambda v: "(" + ", ".join(f"{x:+.2f}" for x in v) + ")"
+        try:
+            print(f"    DEBUG platform {f(sim.getObjectPosition(self.platform, -1))}  UR5 base {f(self.pos(self.ur5))}  "
+                  f"tool {f(self.pos(self.grab_ur5))}  barrel {f(self.pos(self.barrel))}  target {f(target_pose[:3])}")
+            print("    DEBUG joints " + f([sim.getJointPosition(j) for j in self.joints]) +
+                  ("   Bill " + f(sim.getObjectPosition(self.human, -1)) if self.human is not None else ""))
+        except Exception as exc:
+            print(f"    DEBUG could not read positions: {exc}")
+
     def move_tool(self, target_pose, steps=MOVE_STEPS, settle=SETTLE_MAX_STEPS):
         """Stream GrabPoint_UR5 from where it is to target_pose (straight line + slerp), one IK solve per sim step."""
         start = self.pose(self.grab_ur5)
@@ -1098,6 +1110,8 @@ class Robot:
                 misses += 1
             self.step()
         err = self._hold_until_reached(target_pose, max_steps=settle)        # wait for the arm to catch up
+        if err > 0.5:
+            self._explain_big_error(target_pose)
         if misses > steps * 0.3 or err > 0.03:
             print(f"  warning: IK trouble (unsolved {misses}/{steps} ticks, final tool error {err * 1000:.0f} mm). "
                   f"Target may be out of reach: try a different --standoff.")
