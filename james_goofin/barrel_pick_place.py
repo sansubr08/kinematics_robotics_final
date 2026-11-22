@@ -122,6 +122,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
+ROTATE_RADIUS    = 0.0     # m, pull the held barrel in to this distance from the arm base before turning it sideways (0 = off); --rotate-radius
 ROTATE_LIFT      = 0.0     # m, raise the held barrel this much while turning it sideways (more room for the wrist); --rotate-lift
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
@@ -987,6 +988,8 @@ class Robot:
 
     def rotate_sideways(self):
         """Stage 2: rotate the held barrel about the grab point until its axis is horizontal."""
+        if ROTATE_RADIUS > 0:                                                  # a straight-armed UR5 cannot turn its wrist: bend the elbow first
+            self.retract(ROTATE_RADIUS)
         axis = self.barrel_axis_world()
         radial = vsub(self.pos(self.barrel)[:2], self.pos(self.ur5)[:2])
         before = axis_elevation_deg(axis)
@@ -1580,7 +1583,7 @@ def attempt(stage_fn, robot):
 
 
 def main():
-    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT, ROTATE_RADIUS
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
@@ -1594,10 +1597,14 @@ def main():
                     help="where the barrel goes: 'pointb' (default: on PointB, the white box), 'white' (whitest shape), or part of a shape's name")
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
+    ap.add_argument("--rotate-radius", type=float, default=None,
+                    help="pull the held barrel in to this distance (m) from the arm base before turning it sideways, so the elbow is bent (try 0.5)")
     ap.add_argument("--rotate-lift", type=float, default=None,
                     help="raise the held barrel this many metres before turning it sideways (try 0.10-0.25 if the turn fails)")
     args = ap.parse_args()
 
+    if args.rotate_radius is not None:
+        ROTATE_RADIUS = args.rotate_radius
     if args.rotate_lift is not None:
         ROTATE_LIFT = args.rotate_lift
     if args.standoff is not None:
