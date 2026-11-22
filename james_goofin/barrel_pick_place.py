@@ -151,6 +151,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
+ROTATE_LIFT      = 0.0     # m, raise the held barrel this much while turning it sideways (more room for the wrist); --rotate-lift
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
 PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
@@ -1168,6 +1169,10 @@ class Robot:
         p = self.pose(self.grab_ur5)
         q_new = quat_mul(q_rot, p[3:])
         print(f"  barrel axis is {before:.0f} deg off horizontal, rotating...")
+        if ROTATE_LIFT > 0:
+            print(f"  lifting the barrel {ROTATE_LIFT * 100:.0f} cm first (--rotate-lift)")
+            self.move_tool([p[0], p[1], p[2] + ROTATE_LIFT] + list(p[3:]), steps=ROTATE_STEPS // 2)
+            p = self.pose(self.grab_ur5)
         self.move_tool(p[:3] + q_new, steps=ROTATE_STEPS)
         after = axis_elevation_deg(self.barrel_axis_world())
         for _ in range(3):                                                    # the arm lags: finish the turn if it fell short
@@ -1749,7 +1754,7 @@ def attempt(stage_fn, robot):
 
 
 def main():
-    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
@@ -1765,6 +1770,8 @@ def main():
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     ap.add_argument("--sim-human", action="store_true",
                     help="walk the scene's Bill (his own script switched off) back and forth at a speed you choose")
+    ap.add_argument("--rotate-lift", type=float, default=None,
+                    help="raise the held barrel this many metres before turning it sideways (try 0.10-0.25 if the turn fails)")
     ap.add_argument("--cylinder-human", action="store_true",
                     help="with --sim-human: walk an orange cylinder instead of the scene's Bill model")
     ap.add_argument("--human-speed", type=float, default=0.5, help="stand-in human walking speed in m/s (default 0.5; 0 = standing still)")
@@ -1774,6 +1781,8 @@ def main():
                     help="ends of his walk along x (m)")
     args = ap.parse_args()
 
+    if args.rotate_lift is not None:
+        ROTATE_LIFT = args.rotate_lift
     if args.standoff is not None:
         ARM_STANDOFF = args.standoff
     if args.place_on:
