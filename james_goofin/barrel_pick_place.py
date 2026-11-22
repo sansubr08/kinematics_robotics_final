@@ -93,6 +93,24 @@ def ping_pong(s, x_min, x_max):
     return x_min + (u if u <= length else 2.0 * length - u)
 
 
+# Bill's walking cycle, copied from scenes/bill_walking.lua (22 samples over one 1 m stride, linear in between)
+BILL_STRIDE_M = 1.0
+BILL_GAIT = {
+    "Leg":      [0.237,0.228,0.175,-0.014,-0.133,-0.248,-0.323,-0.450,-0.450,-0.442,-0.407,-0.410,-0.377,-0.303,-0.178,-0.111,-0.010,0.046,0.104,0.145,0.188,0.237],
+    "Knee":     [0.282,0.403,0.577,0.929,1.026,1.047,0.939,0.664,0.440,0.243,0.230,0.320,0.366,0.332,0.269,0.222,0.133,0.089,0.065,0.073,0.092,0.282],
+    "Ankle":    [-0.133,0.041,0.244,0.382,0.304,0.232,0.266,0.061,-0.090,-0.145,-0.043,0.041,0.001,0.011,-0.099,-0.127,-0.121,-0.120,-0.107,-0.100,-0.090,-0.133],
+    "Shoulder": [0.028,0.043,0.064,0.078,0.091,0.102,0.170,0.245,0.317,0.337,0.402,0.375,0.331,0.262,0.188,0.102,0.094,0.086,0.080,0.051,0.058,0.028],
+    "Elbow":    [-1.148,-1.080,-1.047,-0.654,-0.517,-0.366,-0.242,-0.117,-0.078,-0.058,-0.031,-0.001,-0.009,0.008,-0.108,-0.131,-0.256,-0.547,-0.709,-0.813,-1.014,-1.148],
+}
+
+
+def gait_value(table, t):
+    """Linear interpolation of a gait table at phase t in [0, 1)."""
+    f = (t % 1.0) * (len(table) - 1)
+    i = min(int(f), len(table) - 2)
+    return table[i] + (table[i + 1] - table[i]) * (f - i)
+
+
 REPLY_TIMEOUT_S  = 90                 # s, give up if CoppeliaSim does not answer a call for this long (a hang, not a slow step)
 CAL_IN_PLACE     = True               # calibrate where the platform stands (small bursts); False = drive to a clear spot first
 CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
@@ -506,6 +524,11 @@ class Robot:
         self.synthetic        = synthetic_human   # None, or dict(speed, pass_y, x_min, x_max) for --sim-human
         self._synth           = None
         self._synth_s         = 0.0
+        self._synth_is_bill   = False      # True when --sim-human is walking the scene's own Bill model
+        self._bill_joints     = {}
+        self._bill_z          = 0.0
+        self._bill_scripts    = []
+        self._bill_check      = None       # expected position of Bill, checked once after the first step
         self.human            = None       # handle of the human model (top of its tree)
         self.human_points     = []         # handles whose positions together describe where the human is
         self.human_sensor     = ProximitySensor(HUMAN_STOP_RADIUS, HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN, HUMAN_CLEAR_CHECKS)
@@ -582,6 +605,8 @@ class Robot:
         for h in self._all_objects():                                        # clear one left over from a crashed run
             if sim.getObjectAlias(h, 0) == SYNTH_ALIAS:
                 sim.removeObjects([h])
+        if not self.synthetic.get("cylinder") and self._adopt_bill():
+            return
         h = sim.createPrimitiveShape(sim.primitiveshape_cylinder, list(SYNTH_SIZE), 0)
         sim.setObjectAlias(h, SYNTH_ALIAS)
         sim.setObjectInt32Param(h, sim.shapeintparam_static, 1)              # we move it ourselves; it must not push anything
@@ -601,24 +626,114 @@ class Robot:
             print("  note: the scene's own 'Bill' is also there and will keep walking. For a clean test use a scene without "
                   "him, or set BILL_MODE = 0 and BILL_TEST_SPOT = 1 in his script.")
 
+    def _adopt_bill(self):
+        """--sim-human: use the scene's own Bill model as the walker (we move him and swing his limbs ourselves)."""
+        sim = self.sim
+        bills = [h for h in self._all_objects()
+                 if sim.getObjectAlias(h, 0) == "Bill" and len(sim.getObjectsInTree(h, sim.object_shape_type, 0)) > 0]
+        if not bills:
+            print("  --sim-human: no model called 'Bill' in this scene, so using an orange cylinder instead.")
+            return False
+        bill = bills[0]
+        joints = {}
+        for h in sim.getObjectsInTree(bill, sim.object_joint_type, 0):
+            joints[norm_name(sim.getObjectAlias(h, 0))] = h
+        need = [f"{side}{part}joint" for side in ("left", "right") for part in ("leg", "knee", "ankle", "shoulder", "elbow")]
+        if any(n not in joints for n in need):
+            print("  --sim-human: Bill's joints were not all found, so using an orange cylinder instead.")
+            return False
+        self._bill_joints = {n: joints[n] for n in need}
+        self._bill_z = sim.getObjectPosition(bill, -1)[2]
+        self._bill_scripts = []
+        for h in [bill] + list(sim.getObjectsInTree(bill, sim.handle_all, 0)):
+            try:
+                if sim.getObjectType(h) == sim.sceneobject_script:
+                    self._bill_scripts.append(h)
+            except Exception:
+                pass
+        for kind in ("scripttype_simulation", "scripttype_childscript"):
+            try:
+                hs = sim.getScript(getattr(sim, kind), bill)
+                if hs not in self._bill_scripts and hs != -1:
+                    self._bill_scripts.append(hs)
+            except Exception:
+                pass
+        self._synth, self._synth_is_bill, self._synth_s = bill, True, 0.0
+        self.human_name = "Bill"
+        c = self.synthetic
+        print(f"  --sim-human: walking the scene's Bill at {c['speed']:.2f} m/s along y = {c['pass_y']:+.2f} m, "
+              f"x from {c['x_min']:+.1f} to {c['x_max']:+.1f} m and back (his own walking script is switched off)")
+        return True
+
+    def _set_bill_script(self, on):
+        sim = self.sim
+        for sc in self._bill_scripts:
+            done = False
+            for fn in (lambda: sim.setBoolProperty(sc, "enabled", bool(on)),
+                       lambda: sim.setScriptInt32Param(sc, sim.scriptintparam_enabled, 1 if on else 0)):
+                try:
+                    fn()
+                    done = True
+                    break
+                except Exception:
+                    continue
+            if not done and not on:
+                print("  warning: could not switch Bill's own walking script off")
+
+    def claim_bill(self):
+        """Call right after startSimulation(): stop Bill's own script and start our walk from the beginning."""
+        if self._synth is None:
+            return
+        self._synth_s = 0.0
+        if self._synth_is_bill:
+            self._set_bill_script(False)
+        self._place_synthetic()
+
     def _place_synthetic(self):
         c = self.synthetic
+        sim = self.sim
         x = ping_pong(self._synth_s, c["x_min"], c["x_max"])
-        self.sim.setObjectPosition(self._synth, -1, [x, c["pass_y"], SYNTH_SIZE[2] / 2.0])
+        if not self._synth_is_bill:
+            sim.setObjectPosition(self._synth, -1, [x, c["pass_y"], SYNTH_SIZE[2] / 2.0])
+            return
+        ahead = ping_pong(self._synth_s + 0.05, c["x_min"], c["x_max"]) - x
+        yaw = getattr(self, "_bill_yaw", 0.0) if abs(ahead) < 1e-9 else (0.0 if ahead > 0 else math.pi)
+        self._bill_yaw = yaw
+        pos = [x, c["pass_y"], self._bill_z]
+        sim.setObjectPosition(self._synth, -1, pos)
+        sim.setObjectOrientation(self._synth, -1, [0.0, 0.0, yaw])
+        t1 = (self._synth_s / BILL_STRIDE_M) % 1.0
+        t2 = (t1 + 0.5) % 1.0
+        for side, t in (("left", t1), ("right", t2)):
+            for part in ("leg", "knee", "ankle", "shoulder", "elbow"):
+                sim.setJointPosition(self._bill_joints[f"{side}{part}joint"], gait_value(BILL_GAIT[part.capitalize()], t))
+        self._bill_check = pos
 
     def _sim_step(self):
         """One simulation step; also advances the stand-in human (--sim-human) by one step of walking."""
         self.sim.step()
         if self._synth is not None:
+            if self._synth_is_bill and self._bill_check is not None:
+                got = self.sim.getObjectPosition(self._synth, -1)
+                if math.dist(got[:2], self._bill_check[:2]) > 0.05:
+                    print("  warning: Bill's own script is still moving him, so --sim-human speed will not match. "
+                          "Run with --cylinder-human, or set BILL_MODE = 0 in his script.")
+                self._bill_check = None
             self._synth_s += self.synthetic["speed"] * self.sim.getSimulationTimeStep()
             self._place_synthetic()
 
     def remove_synthetic(self):
         if self._synth is not None:
-            try:
-                self.sim.removeObjects([self._synth])
-            except Exception:
-                pass
+            if self._synth_is_bill:
+                try:
+                    self._set_bill_script(True)                              # give Bill his own walking script back
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.sim.removeObjects([self._synth])
+                except Exception:
+                    pass
             self._synth = None
 
     def _resolve_human(self):
@@ -821,6 +936,7 @@ class Robot:
 
         sim.setStepping(True)
         sim.startSimulation()
+        self.claim_bill()
         # keep the arm exactly where it started, and freeze the barrel so the gripper can't knock it over
         for j in self.joints:
             try:
@@ -1421,6 +1537,7 @@ class Robot:
             print("  no clear spot found (nothing {:.1f} m away from every obstacle); calibrating in place with small bursts".format(CAL_CLEAR_M))
         sim.setStepping(True)
         sim.startSimulation()
+        self.claim_bill()
         try:
             for j in self.joints:
                 try:
@@ -1647,7 +1764,9 @@ def main():
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
     ap.add_argument("--sim-human", action="store_true",
-                    help="walk a stand-in human (an orange cylinder) back and forth at a speed you choose, instead of relying on the scene's Bill")
+                    help="walk the scene's Bill (his own script switched off) back and forth at a speed you choose")
+    ap.add_argument("--cylinder-human", action="store_true",
+                    help="with --sim-human: walk an orange cylinder instead of the scene's Bill model")
     ap.add_argument("--human-speed", type=float, default=0.5, help="stand-in human walking speed in m/s (default 0.5; 0 = standing still)")
     ap.add_argument("--human-pass-y", type=float, default=-0.7,
                     help="the line he walks along (world y, m). The platform sits at y -0.32..+0.32, so -0.7 passes close enough to trigger the stop")
@@ -1665,7 +1784,8 @@ def main():
     synthetic = None
     if args.sim_human:
         synthetic = dict(speed=args.human_speed, pass_y=args.human_pass_y,
-                         x_min=min(args.human_x_range), x_max=max(args.human_x_range))
+                         x_min=min(args.human_x_range), x_max=max(args.human_x_range),
+                         cylinder=args.cylinder_human)
     robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor,
                   force_builtin_ik=args.builtin_ik, synthetic_human=synthetic)
     import atexit
