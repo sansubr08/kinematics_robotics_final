@@ -82,35 +82,6 @@ WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from th
 WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
 CAL_SCALE        = 0.7                # calibration burst speed, as a multiple of WHEEL_V
 CAL_STEPS        = 24                 # sim steps per calibration burst (one wheel at a time, forward then back)
-SYNTH_ALIAS      = "SyntheticBill"     # the stand-in human made by --sim-human
-SYNTH_SIZE       = (0.5, 0.5, 1.7)     # m, a cylinder about as wide and tall as a person
-
-
-def ping_pong(s, x_min, x_max):
-    """Position along a straight walk that goes x_min -> x_max -> x_min -> ... after s metres of walking."""
-    length = x_max - x_min
-    u = s % (2.0 * length)
-    return x_min + (u if u <= length else 2.0 * length - u)
-
-
-# Bill's walking cycle, copied from scenes/bill_walking.lua (22 samples over one 1 m stride, linear in between)
-BILL_STRIDE_M = 1.0
-BILL_GAIT = {
-    "Leg":      [0.237,0.228,0.175,-0.014,-0.133,-0.248,-0.323,-0.450,-0.450,-0.442,-0.407,-0.410,-0.377,-0.303,-0.178,-0.111,-0.010,0.046,0.104,0.145,0.188,0.237],
-    "Knee":     [0.282,0.403,0.577,0.929,1.026,1.047,0.939,0.664,0.440,0.243,0.230,0.320,0.366,0.332,0.269,0.222,0.133,0.089,0.065,0.073,0.092,0.282],
-    "Ankle":    [-0.133,0.041,0.244,0.382,0.304,0.232,0.266,0.061,-0.090,-0.145,-0.043,0.041,0.001,0.011,-0.099,-0.127,-0.121,-0.120,-0.107,-0.100,-0.090,-0.133],
-    "Shoulder": [0.028,0.043,0.064,0.078,0.091,0.102,0.170,0.245,0.317,0.337,0.402,0.375,0.331,0.262,0.188,0.102,0.094,0.086,0.080,0.051,0.058,0.028],
-    "Elbow":    [-1.148,-1.080,-1.047,-0.654,-0.517,-0.366,-0.242,-0.117,-0.078,-0.058,-0.031,-0.001,-0.009,0.008,-0.108,-0.131,-0.256,-0.547,-0.709,-0.813,-1.014,-1.148],
-}
-
-
-def gait_value(table, t):
-    """Linear interpolation of a gait table at phase t in [0, 1)."""
-    f = (t % 1.0) * (len(table) - 1)
-    i = min(int(f), len(table) - 2)
-    return table[i] + (table[i + 1] - table[i]) * (f - i)
-
-
 REPLY_TIMEOUT_S  = 90                 # s, give up if CoppeliaSim does not answer a call for this long (a hang, not a slow step)
 CAL_IN_PLACE     = True               # calibrate where the platform stands (small bursts); False = drive to a clear spot first
 CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
@@ -151,8 +122,6 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
-IK_RESET_AFTER_STOP = True            # rebuild the IK world after a human stop; --no-ik-reset turns this off (to test if it misbehaves)
-ROTATE_LIFT      = 0.0     # m, raise the held barrel this much while turning it sideways (more room for the wrist); --rotate-lift
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
 PLACE_TOL_M      = 0.10    # m, barrel final xy must be this close to PointB
@@ -495,7 +464,7 @@ class ProximitySensor:
 class Robot:
     """Everything that talks to CoppeliaSim lives in here."""
 
-    def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False, synthetic_human=None):
+    def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
         try:                                              # never hang forever on a CoppeliaSim that has stopped answering
@@ -523,14 +492,6 @@ class Robot:
         # human safety state
         self.human_name       = human_name
         self.use_human_sensor = use_human_sensor
-        self.synthetic        = synthetic_human   # None, or dict(speed, pass_y, x_min, x_max) for --sim-human
-        self._synth           = None
-        self._synth_s         = 0.0
-        self._synth_is_bill   = False      # True when --sim-human is walking the scene's own Bill model
-        self._bill_joints     = {}
-        self._bill_z          = 0.0
-        self._bill_scripts    = []
-        self._bill_check      = None       # expected position of Bill, checked once after the first step
         self.human            = None       # handle of the human model (top of its tree)
         self.human_points     = []         # handles whose positions together describe where the human is
         self.human_sensor     = ProximitySensor(HUMAN_STOP_RADIUS, HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN, HUMAN_CLEAR_CHECKS)
@@ -601,149 +562,10 @@ class Robot:
         self._resolve_human()                # before the bump monitor: it must know which shapes are the human
         self._build_bump_monitor()
 
-    def _make_synthetic(self):
-        """--sim-human: make a person-sized cylinder that Python walks back and forth at a speed we choose."""
-        sim = self.sim
-        for h in self._all_objects():                                        # clear one left over from a crashed run
-            if sim.getObjectAlias(h, 0) == SYNTH_ALIAS:
-                sim.removeObjects([h])
-        if not self.synthetic.get("cylinder") and self._adopt_bill():
-            return
-        h = sim.createPrimitiveShape(sim.primitiveshape_cylinder, list(SYNTH_SIZE), 0)
-        sim.setObjectAlias(h, SYNTH_ALIAS)
-        sim.setObjectInt32Param(h, sim.shapeintparam_static, 1)              # we move it ourselves; it must not push anything
-        sim.setObjectInt32Param(h, sim.shapeintparam_respondable, 0)
-        try:
-            sim.setShapeColor(h, None, sim.colorcomponent_ambient_diffuse, [1.0, 0.45, 0.0])
-        except Exception:
-            pass
-        self._synth, self._synth_s = h, 0.0
-        self._place_synthetic()
-        self.human_name = SYNTH_ALIAS
-        others = [sim.getObjectAlias(o, 0) for o in self._all_objects() if sim.getObjectAlias(o, 0) == "Bill"]
-        c = self.synthetic
-        print(f"  --sim-human: walking a stand-in human at {c['speed']:.2f} m/s along y = {c['pass_y']:+.2f} m, "
-              f"x from {c['x_min']:+.1f} to {c['x_max']:+.1f} m and back")
-        if others:
-            print("  note: the scene's own 'Bill' is also there and will keep walking. For a clean test use a scene without "
-                  "him, or set BILL_MODE = 0 and BILL_TEST_SPOT = 1 in his script.")
-
-    def _adopt_bill(self):
-        """--sim-human: use the scene's own Bill model as the walker (we move him and swing his limbs ourselves)."""
-        sim = self.sim
-        bills = [h for h in self._all_objects()
-                 if sim.getObjectAlias(h, 0) == "Bill" and len(sim.getObjectsInTree(h, sim.object_shape_type, 0)) > 0]
-        if not bills:
-            print("  --sim-human: no model called 'Bill' in this scene, so using an orange cylinder instead.")
-            return False
-        bill = bills[0]
-        joints = {}
-        for h in sim.getObjectsInTree(bill, sim.object_joint_type, 0):
-            joints[norm_name(sim.getObjectAlias(h, 0))] = h
-        need = [f"{side}{part}joint" for side in ("left", "right") for part in ("leg", "knee", "ankle", "shoulder", "elbow")]
-        if any(n not in joints for n in need):
-            print("  --sim-human: Bill's joints were not all found, so using an orange cylinder instead.")
-            return False
-        self._bill_joints = {n: joints[n] for n in need}
-        self._bill_z = sim.getObjectPosition(bill, -1)[2]
-        self._bill_scripts = []
-        for h in [bill] + list(sim.getObjectsInTree(bill, sim.handle_all, 0)):
-            try:
-                if sim.getObjectType(h) == sim.sceneobject_script:
-                    self._bill_scripts.append(h)
-            except Exception:
-                pass
-        for kind in ("scripttype_simulation", "scripttype_childscript"):
-            try:
-                hs = sim.getScript(getattr(sim, kind), bill)
-                if hs not in self._bill_scripts and hs != -1:
-                    self._bill_scripts.append(hs)
-            except Exception:
-                pass
-        self._synth, self._synth_is_bill, self._synth_s = bill, True, 0.0
-        self.human_name = "Bill"
-        c = self.synthetic
-        print(f"  --sim-human: walking the scene's Bill at {c['speed']:.2f} m/s along y = {c['pass_y']:+.2f} m, "
-              f"x from {c['x_min']:+.1f} to {c['x_max']:+.1f} m and back (his own walking script is switched off)")
-        return True
-
-    def _set_bill_script(self, on):
-        sim = self.sim
-        for sc in self._bill_scripts:
-            done = False
-            for fn in (lambda: sim.setBoolProperty(sc, "enabled", bool(on)),
-                       lambda: sim.setScriptInt32Param(sc, sim.scriptintparam_enabled, 1 if on else 0)):
-                try:
-                    fn()
-                    done = True
-                    break
-                except Exception:
-                    continue
-            if not done and not on:
-                print("  warning: could not switch Bill's own walking script off")
-
-    def claim_bill(self):
-        """Call right after startSimulation(): stop Bill's own script and start our walk from the beginning."""
-        if self._synth is None:
-            return
-        self._synth_s = 0.0
-        if self._synth_is_bill:
-            self._set_bill_script(False)
-        self._place_synthetic()
-
-    def _place_synthetic(self):
-        c = self.synthetic
-        sim = self.sim
-        x = ping_pong(self._synth_s, c["x_min"], c["x_max"])
-        if not self._synth_is_bill:
-            sim.setObjectPosition(self._synth, -1, [x, c["pass_y"], SYNTH_SIZE[2] / 2.0])
-            return
-        ahead = ping_pong(self._synth_s + 0.05, c["x_min"], c["x_max"]) - x
-        yaw = getattr(self, "_bill_yaw", 0.0) if abs(ahead) < 1e-9 else (0.0 if ahead > 0 else math.pi)
-        self._bill_yaw = yaw
-        pos = [x, c["pass_y"], self._bill_z]
-        sim.setObjectPosition(self._synth, -1, pos)
-        sim.setObjectOrientation(self._synth, -1, [0.0, 0.0, yaw])
-        t1 = (self._synth_s / BILL_STRIDE_M) % 1.0
-        t2 = (t1 + 0.5) % 1.0
-        for side, t in (("left", t1), ("right", t2)):
-            for part in ("leg", "knee", "ankle", "shoulder", "elbow"):
-                sim.setJointPosition(self._bill_joints[f"{side}{part}joint"], gait_value(BILL_GAIT[part.capitalize()], t))
-        self._bill_check = pos
-
-    def _sim_step(self):
-        """One simulation step; also advances the stand-in human (--sim-human) by one step of walking."""
-        self.sim.step()
-        if self._synth is not None:
-            if self._synth_is_bill and self._bill_check is not None:
-                got = self.sim.getObjectPosition(self._synth, -1)
-                if math.dist(got[:2], self._bill_check[:2]) > 0.05:
-                    print("  warning: Bill's own script is still moving him, so --sim-human speed will not match. "
-                          "Run with --cylinder-human, or set BILL_MODE = 0 in his script.")
-                self._bill_check = None
-            self._synth_s += self.synthetic["speed"] * self.sim.getSimulationTimeStep()
-            self._place_synthetic()
-
-    def remove_synthetic(self):
-        if self._synth is not None:
-            if self._synth_is_bill:
-                try:
-                    self._set_bill_script(True)                              # give Bill his own walking script back
-                except Exception:
-                    pass
-            else:
-                try:
-                    self.sim.removeObjects([self._synth])
-                except Exception:
-                    pass
-            self._synth = None
-
     def _resolve_human(self):
         """Find the walking human (the topmost object whose alias matches) and the handles that track where he is."""
         sim = self.sim
         self.human, self.human_points = None, []
-        if self.synthetic is not None and self._synth is None:
-            self._make_synthetic()
         if not self.use_human_sensor:
             print("  human-proximity sensor DISABLED (--no-human-sensor): the arm will NOT retract for people.")
             return
@@ -830,7 +652,7 @@ class Robot:
 
     def step(self, n=1):
         for _ in range(n):
-            self._sim_step()
+            self.sim.step()
             if self.guard_on and not self._guarding:
                 self._guard()
 
@@ -884,7 +706,7 @@ class Robot:
                 self._joint_targets(self.joint_start)                           # retract NOW
                 waited = 0
                 while self.human_sensor.near:
-                    self._sim_step()
+                    sim.step()
                     waited += 1
                     if waited > HUMAN_MAX_WAIT_STEPS:
                         raise HumanTooClose(f"human stayed within {HUMAN_STOP_RADIUS:.2f} m of the arm for "
@@ -898,7 +720,7 @@ class Robot:
                 for i in range(1, HUMAN_RESUME_STEPS + 1):
                     t = i / HUMAN_RESUME_STEPS
                     self._joint_targets([a + t * (b - a) for a, b in zip(self.joint_start, resume_q)])
-                    self._sim_step()
+                    sim.step()
                     if self.human_sensor.update(self.human_distance()):
                         print("  human came back: retracting again")
                         interrupted = True
@@ -908,7 +730,7 @@ class Robot:
                         if max(abs(sim.getJointPosition(j) - q) for j, q in zip(self.joints, resume_q)) < 0.01:
                             break
                         self._joint_targets(resume_q)
-                        self._sim_step()
+                        sim.step()
                         if self.human_sensor.update(self.human_distance()):
                             print("  human came back: retracting again")
                             interrupted = True
@@ -916,8 +738,6 @@ class Robot:
                 if not interrupted:
                     break
             sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
-            if IK_RESET_AFTER_STOP:
-                self.reset_ik()
             print("  arm is back where it was; carrying on with the move")
             self.guard_intervened = True
         finally:
@@ -939,7 +759,6 @@ class Robot:
 
         sim.setStepping(True)
         sim.startSimulation()
-        self.claim_bill()
         # keep the arm exactly where it started, and freeze the barrel so the gripper can't knock it over
         for j in self.joints:
             try:
@@ -975,11 +794,8 @@ class Robot:
                 self.sim.setJointTargetVelocity(w, 0.0)
             except Exception:
                 pass
-        try:
-            self.sim.stopSimulation(True)
-            self._restore_barrel()
-        except Exception as exc:                          # e.g. CoppeliaSim stopped answering: keep the ORIGINAL error visible
-            print(f"  (could not stop the simulation cleanly: {type(exc).__name__})")
+        self.sim.stopSimulation(True)
+        self._restore_barrel()
 
     def _restore_barrel(self):
         sim = self.sim
@@ -1028,10 +844,6 @@ class Robot:
         if simIK is None:
             self._build_builtin_ik()
             return
-        self._make_ik_group()
-
-    def _make_ik_group(self):
-        simIK = self.simIK
         self.ik_env = simIK.createEnvironment()
         self.ik_group = simIK.createGroup(self.ik_env)
         simIK.setGroupCalculation(self.ik_env, self.ik_group, simIK.method_damped_least_squares, 0.1, 99)
@@ -1041,17 +853,6 @@ class Robot:
             constraints = (simIK.constraint_x | simIK.constraint_y | simIK.constraint_z
                            | simIK.constraint_alpha_beta | simIK.constraint_gamma)
         simIK.addElementFromScene(self.ik_env, self.ik_group, self.ur5, self.grab_ur5, self.ik_target, constraints)
-
-    def reset_ik(self):
-        """Throw the IK world away and rebuild it from the scene as it is NOW. Done after the barrel is glued on or let
-        go, and after every human stop, so the solver never works from a stale copy of the arm."""
-        if self.simIK is None or self.ik_env is None:
-            return
-        try:
-            self.simIK.eraseEnvironment(self.ik_env)
-        except Exception:
-            pass
-        self._make_ik_group()
 
     def _ik_to_builtin(self, pose):
         sim = self.sim
@@ -1088,18 +889,6 @@ class Robot:
                 break
         return err
 
-    def _explain_big_error(self, target_pose):
-        """A tool error of metres means something flew away, not that IK is hard. Say where everything is."""
-        sim = self.sim
-        f = lambda v: "(" + ", ".join(f"{x:+.2f}" for x in v) + ")"
-        try:
-            print(f"    DEBUG platform {f(sim.getObjectPosition(self.platform, -1))}  UR5 base {f(self.pos(self.ur5))}  "
-                  f"tool {f(self.pos(self.grab_ur5))}  barrel {f(self.pos(self.barrel))}  target {f(target_pose[:3])}")
-            print("    DEBUG joints " + f([sim.getJointPosition(j) for j in self.joints]) +
-                  ("   Bill " + f(sim.getObjectPosition(self.human, -1)) if self.human is not None else ""))
-        except Exception as exc:
-            print(f"    DEBUG could not read positions: {exc}")
-
     def move_tool(self, target_pose, steps=MOVE_STEPS, settle=SETTLE_MAX_STEPS):
         """Stream GrabPoint_UR5 from where it is to target_pose (straight line + slerp), one IK solve per sim step."""
         start = self.pose(self.grab_ur5)
@@ -1112,8 +901,6 @@ class Robot:
                 misses += 1
             self.step()
         err = self._hold_until_reached(target_pose, max_steps=settle)        # wait for the arm to catch up
-        if err > 0.5:
-            self._explain_big_error(target_pose)
         if misses > steps * 0.3 or err > 0.03:
             print(f"  warning: IK trouble (unsolved {misses}/{steps} ticks, final tool error {err * 1000:.0f} mm). "
                   f"Target may be out of reach: try a different --standoff.")
@@ -1130,7 +917,6 @@ class Robot:
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, 0)
         sim.setObjectParent(self.barrel, self.grab_ur5, True)
         self.barrel_held = True
-        self.reset_ik()
         self.step(10)
         gap = vnorm(vsub(self.pos(self.grab_barrel), self.pos(self.grab_ur5)))
         return gap
@@ -1141,7 +927,6 @@ class Robot:
         sim.setObjectParent(self.barrel, -1, True)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, self.barrel_respond0 or 1)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_static, 0)
-        self.reset_ik()
         self.step(SETTLE_STEPS)
 
     # ---------- the two arm tasks ----------
@@ -1185,10 +970,6 @@ class Robot:
         p = self.pose(self.grab_ur5)
         q_new = quat_mul(q_rot, p[3:])
         print(f"  barrel axis is {before:.0f} deg off horizontal, rotating...")
-        if ROTATE_LIFT > 0:
-            print(f"  lifting the barrel {ROTATE_LIFT * 100:.0f} cm first (--rotate-lift)")
-            self.move_tool([p[0], p[1], p[2] + ROTATE_LIFT] + list(p[3:]), steps=ROTATE_STEPS // 2)
-            p = self.pose(self.grab_ur5)
         self.move_tool(p[:3] + q_new, steps=ROTATE_STEPS)
         after = axis_elevation_deg(self.barrel_axis_world())
         for _ in range(3):                                                    # the arm lags: finish the turn if it fell short
@@ -1558,7 +1339,6 @@ class Robot:
             print("  no clear spot found (nothing {:.1f} m away from every obstacle); calibrating in place with small bursts".format(CAL_CLEAR_M))
         sim.setStepping(True)
         sim.startSimulation()
-        self.claim_bill()
         try:
             for j in self.joints:
                 try:
@@ -1770,7 +1550,7 @@ def attempt(stage_fn, robot):
 
 
 def main():
-    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON, ROTATE_LIFT, IK_RESET_AFTER_STOP
+    global ARM_STANDOFF, HUMAN_STOP_RADIUS, PLACE_ON
     ap = argparse.ArgumentParser(description="Barrel pick-and-place with OmniPlatform + UR5")
     ap.add_argument("--mode", choices=["ur5", "full", "all"], default="all",
                     help="ur5 = stages 1-2, full = stages 3-4, all = both (default)")
@@ -1784,25 +1564,8 @@ def main():
                     help="where the barrel goes: 'pointb' (default: on PointB, the white box), 'white' (whitest shape), or part of a shape's name")
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
-    ap.add_argument("--sim-human", action="store_true",
-                    help="walk the scene's Bill (his own script switched off) back and forth at a speed you choose")
-    ap.add_argument("--no-ik-reset", action="store_true",
-                    help="do not rebuild the IK world after a human stop (to test whether the rebuild is what breaks the arm)")
-    ap.add_argument("--rotate-lift", type=float, default=None,
-                    help="raise the held barrel this many metres before turning it sideways (try 0.10-0.25 if the turn fails)")
-    ap.add_argument("--cylinder-human", action="store_true",
-                    help="with --sim-human: walk an orange cylinder instead of the scene's Bill model")
-    ap.add_argument("--human-speed", type=float, default=0.5, help="stand-in human walking speed in m/s (default 0.5; 0 = standing still)")
-    ap.add_argument("--human-pass-y", type=float, default=-0.7,
-                    help="the line he walks along (world y, m). The platform sits at y -0.32..+0.32, so -0.7 passes close enough to trigger the stop")
-    ap.add_argument("--human-x-range", type=float, nargs=2, default=[-3.0, 3.0], metavar=("X_MIN", "X_MAX"),
-                    help="ends of his walk along x (m)")
     args = ap.parse_args()
 
-    if args.no_ik_reset:
-        IK_RESET_AFTER_STOP = False
-    if args.rotate_lift is not None:
-        ROTATE_LIFT = args.rotate_lift
     if args.standoff is not None:
         ARM_STANDOFF = args.standoff
     if args.place_on:
@@ -1810,15 +1573,8 @@ def main():
     if args.human_radius is not None:
         HUMAN_STOP_RADIUS = args.human_radius
 
-    synthetic = None
-    if args.sim_human:
-        synthetic = dict(speed=args.human_speed, pass_y=args.human_pass_y,
-                         x_min=min(args.human_x_range), x_max=max(args.human_x_range),
-                         cylinder=args.cylinder_human)
     robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor,
-                  force_builtin_ik=args.builtin_ik, synthetic_human=synthetic)
-    import atexit
-    atexit.register(robot.remove_synthetic)                                    # take the stand-in human out of the scene again
+                  force_builtin_ik=args.builtin_ik)
     robot.scene_summary()
     if args.discover:
         robot.discover()
@@ -1844,11 +1600,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        chain, e = [], exc
-        while e is not None:
-            chain.append(type(e).__name__)
-            e = e.__cause__ or e.__context__
-        if "Again" in chain:                              # zmq.Again = our receive timeout
+        if type(exc).__name__ == "Again":                 # zmq.Again = our receive timeout
             print(f"\nCoppeliaSim did not answer for {REPLY_TIMEOUT_S} s, so the script stopped instead of hanging.\n"
                   f"Look at the CoppeliaSim window: is a dialog box or error message open, is the simulation paused,\n"
                   f"or does the console at the bottom show a Lua error (for example from Bill's script)?")
