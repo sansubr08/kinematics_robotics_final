@@ -122,7 +122,7 @@ SETTLE_MAX_STEPS = 300     # sim steps an arm move may wait for the arm to actua
 
 # --- pass/fail thresholds ---
 GLUE_TOL_M       = 0.01    # m, dummies must be this close for the grab to count
-ROTATE_RADIUS    = 0.0     # m, pull the held barrel in to this distance from the arm base before turning it sideways (0 = off); --rotate-radius
+ROTATE_RADIUS    = 0.5     # m, pull the held barrel in to this distance from the arm base before turning it sideways (0 = off); --rotate-radius
 ROTATE_LIFT      = 0.0     # m, raise the held barrel this much while turning it sideways (more room for the wrist); --rotate-lift
 SIDEWAYS_TOL_DEG = 5.0     # deg, barrel axis must be this close to horizontal
 PLACE_ON         = "pointb"              # where to set the barrel: "pointb" = on PointB (the white box in this scene), "white" = the whitest shape, or part of a shape's name
