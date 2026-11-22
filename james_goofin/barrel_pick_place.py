@@ -82,6 +82,17 @@ WHEEL_V          = 80 * 2.398795 * math.pi / 180   # default wheel speed from th
 WHEEL_MAX        = 2.0 * WHEEL_V      # rad/s, never command a wheel faster than this
 CAL_SCALE        = 0.7                # calibration burst speed, as a multiple of WHEEL_V
 CAL_STEPS        = 24                 # sim steps per calibration burst (one wheel at a time, forward then back)
+SYNTH_ALIAS      = "SyntheticBill"     # the stand-in human made by --sim-human
+SYNTH_SIZE       = (0.5, 0.5, 1.7)     # m, a cylinder about as wide and tall as a person
+
+
+def ping_pong(s, x_min, x_max):
+    """Position along a straight walk that goes x_min -> x_max -> x_min -> ... after s metres of walking."""
+    length = x_max - x_min
+    u = s % (2.0 * length)
+    return x_min + (u if u <= length else 2.0 * length - u)
+
+
 REPLY_TIMEOUT_S  = 90                 # s, give up if CoppeliaSim does not answer a call for this long (a hang, not a slow step)
 CAL_IN_PLACE     = True               # calibrate where the platform stands (small bursts); False = drive to a clear spot first
 CAL_CLEAR_M      = 0.6                # m, calibration happens where the platform is at least this far from everything
@@ -464,7 +475,7 @@ class ProximitySensor:
 class Robot:
     """Everything that talks to CoppeliaSim lives in here."""
 
-    def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False):
+    def __init__(self, human_name=None, use_human_sensor=True, force_builtin_ik=False, synthetic_human=None):
         from coppeliasim_zmqremoteapi_client import RemoteAPIClient   # imported here so the math above is testable offline
         self.client = RemoteAPIClient()
         try:                                              # never hang forever on a CoppeliaSim that has stopped answering
@@ -492,6 +503,9 @@ class Robot:
         # human safety state
         self.human_name       = human_name
         self.use_human_sensor = use_human_sensor
+        self.synthetic        = synthetic_human   # None, or dict(speed, pass_y, x_min, x_max) for --sim-human
+        self._synth           = None
+        self._synth_s         = 0.0
         self.human            = None       # handle of the human model (top of its tree)
         self.human_points     = []         # handles whose positions together describe where the human is
         self.human_sensor     = ProximitySensor(HUMAN_STOP_RADIUS, HUMAN_STOP_RADIUS + HUMAN_CLEAR_MARGIN, HUMAN_CLEAR_CHECKS)
@@ -562,10 +576,57 @@ class Robot:
         self._resolve_human()                # before the bump monitor: it must know which shapes are the human
         self._build_bump_monitor()
 
+    def _make_synthetic(self):
+        """--sim-human: make a person-sized cylinder that Python walks back and forth at a speed we choose."""
+        sim = self.sim
+        for h in self._all_objects():                                        # clear one left over from a crashed run
+            if sim.getObjectAlias(h, 0) == SYNTH_ALIAS:
+                sim.removeObjects([h])
+        h = sim.createPrimitiveShape(sim.primitiveshape_cylinder, list(SYNTH_SIZE), 0)
+        sim.setObjectAlias(h, SYNTH_ALIAS)
+        sim.setObjectInt32Param(h, sim.shapeintparam_static, 1)              # we move it ourselves; it must not push anything
+        sim.setObjectInt32Param(h, sim.shapeintparam_respondable, 0)
+        try:
+            sim.setShapeColor(h, None, sim.colorcomponent_ambient_diffuse, [1.0, 0.45, 0.0])
+        except Exception:
+            pass
+        self._synth, self._synth_s = h, 0.0
+        self._place_synthetic()
+        self.human_name = SYNTH_ALIAS
+        others = [sim.getObjectAlias(o, 0) for o in self._all_objects() if sim.getObjectAlias(o, 0) == "Bill"]
+        c = self.synthetic
+        print(f"  --sim-human: walking a stand-in human at {c['speed']:.2f} m/s along y = {c['pass_y']:+.2f} m, "
+              f"x from {c['x_min']:+.1f} to {c['x_max']:+.1f} m and back")
+        if others:
+            print("  note: the scene's own 'Bill' is also there and will keep walking. For a clean test use a scene without "
+                  "him, or set BILL_MODE = 0 and BILL_TEST_SPOT = 1 in his script.")
+
+    def _place_synthetic(self):
+        c = self.synthetic
+        x = ping_pong(self._synth_s, c["x_min"], c["x_max"])
+        self.sim.setObjectPosition(self._synth, -1, [x, c["pass_y"], SYNTH_SIZE[2] / 2.0])
+
+    def _sim_step(self):
+        """One simulation step; also advances the stand-in human (--sim-human) by one step of walking."""
+        self.sim.step()
+        if self._synth is not None:
+            self._synth_s += self.synthetic["speed"] * self.sim.getSimulationTimeStep()
+            self._place_synthetic()
+
+    def remove_synthetic(self):
+        if self._synth is not None:
+            try:
+                self.sim.removeObjects([self._synth])
+            except Exception:
+                pass
+            self._synth = None
+
     def _resolve_human(self):
         """Find the walking human (the topmost object whose alias matches) and the handles that track where he is."""
         sim = self.sim
         self.human, self.human_points = None, []
+        if self.synthetic is not None and self._synth is None:
+            self._make_synthetic()
         if not self.use_human_sensor:
             print("  human-proximity sensor DISABLED (--no-human-sensor): the arm will NOT retract for people.")
             return
@@ -652,7 +713,7 @@ class Robot:
 
     def step(self, n=1):
         for _ in range(n):
-            self.sim.step()
+            self._sim_step()
             if self.guard_on and not self._guarding:
                 self._guard()
 
@@ -706,7 +767,7 @@ class Robot:
                 self._joint_targets(self.joint_start)                           # retract NOW
                 waited = 0
                 while self.human_sensor.near:
-                    sim.step()
+                    self._sim_step()
                     waited += 1
                     if waited > HUMAN_MAX_WAIT_STEPS:
                         raise HumanTooClose(f"human stayed within {HUMAN_STOP_RADIUS:.2f} m of the arm for "
@@ -720,7 +781,7 @@ class Robot:
                 for i in range(1, HUMAN_RESUME_STEPS + 1):
                     t = i / HUMAN_RESUME_STEPS
                     self._joint_targets([a + t * (b - a) for a, b in zip(self.joint_start, resume_q)])
-                    sim.step()
+                    self._sim_step()
                     if self.human_sensor.update(self.human_distance()):
                         print("  human came back: retracting again")
                         interrupted = True
@@ -730,7 +791,7 @@ class Robot:
                         if max(abs(sim.getJointPosition(j) - q) for j, q in zip(self.joints, resume_q)) < 0.01:
                             break
                         self._joint_targets(resume_q)
-                        sim.step()
+                        self._sim_step()
                         if self.human_sensor.update(self.human_distance()):
                             print("  human came back: retracting again")
                             interrupted = True
@@ -1585,6 +1646,13 @@ def main():
                     help="where the barrel goes: 'pointb' (default: on PointB, the white box), 'white' (whitest shape), or part of a shape's name")
     ap.add_argument("--builtin-ik", action="store_true", help="use the built-in IK solver even if CoppeliaSim's simIK loads")
     ap.add_argument("--no-human-sensor", action="store_true", help="turn the human-proximity safety off")
+    ap.add_argument("--sim-human", action="store_true",
+                    help="walk a stand-in human (an orange cylinder) back and forth at a speed you choose, instead of relying on the scene's Bill")
+    ap.add_argument("--human-speed", type=float, default=0.5, help="stand-in human walking speed in m/s (default 0.5; 0 = standing still)")
+    ap.add_argument("--human-pass-y", type=float, default=-0.7,
+                    help="the line he walks along (world y, m). The platform sits at y -0.32..+0.32, so -0.7 passes close enough to trigger the stop")
+    ap.add_argument("--human-x-range", type=float, nargs=2, default=[-3.0, 3.0], metavar=("X_MIN", "X_MAX"),
+                    help="ends of his walk along x (m)")
     args = ap.parse_args()
 
     if args.standoff is not None:
@@ -1594,8 +1662,14 @@ def main():
     if args.human_radius is not None:
         HUMAN_STOP_RADIUS = args.human_radius
 
+    synthetic = None
+    if args.sim_human:
+        synthetic = dict(speed=args.human_speed, pass_y=args.human_pass_y,
+                         x_min=min(args.human_x_range), x_max=max(args.human_x_range))
     robot = Robot(human_name=args.human, use_human_sensor=not args.no_human_sensor,
-                  force_builtin_ik=args.builtin_ik)
+                  force_builtin_ik=args.builtin_ik, synthetic_human=synthetic)
+    import atexit
+    atexit.register(robot.remove_synthetic)                                    # take the stand-in human out of the scene again
     robot.scene_summary()
     if args.discover:
         robot.discover()
