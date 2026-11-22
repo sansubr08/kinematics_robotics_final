@@ -1020,6 +1020,10 @@ class Robot:
         """Stage 4 end: put the sideways barrel over target_xy, lower it onto the surface at surface_z, let go."""
         center = self.pos(self.barrel)
         tool = self.pose(self.grab_ur5)
+        base = self.pos(self.ur5)
+        print(f"  placing: arm base ({base[0]:+.2f}, {base[1]:+.2f})  barrel ({center[0]:+.2f}, {center[1]:+.2f}, {center[2]:.2f})  "
+              f"tool ({tool[0]:+.2f}, {tool[1]:+.2f}, {tool[2]:.2f})  target ({target_xy[0]:+.2f}, {target_xy[1]:+.2f})  "
+              f"-> base-to-barrel {math.dist(base[:2], center[:2]):.2f} m, base-to-target {math.dist(base[:2], target_xy):.2f} m")
         dx = target_xy[0] - center[0]
         dy = target_xy[1] - center[1]
         self.move_tool([tool[0] + dx, tool[1] + dy, tool[2]] + tool[3:])                   # slide over the spot
