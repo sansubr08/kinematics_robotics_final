@@ -738,6 +738,7 @@ class Robot:
                 if not interrupted:
                     break
             sim.setObjectPose(self.ik_target, -1, self.pose(self.grab_ur5))   # IK carries on from where the arm really is
+            self.reset_ik()
             print("  arm is back where it was; carrying on with the move")
             self.guard_intervened = True
         finally:
@@ -794,8 +795,11 @@ class Robot:
                 self.sim.setJointTargetVelocity(w, 0.0)
             except Exception:
                 pass
-        self.sim.stopSimulation(True)
-        self._restore_barrel()
+        try:
+            self.sim.stopSimulation(True)
+            self._restore_barrel()
+        except Exception as exc:                          # e.g. CoppeliaSim stopped answering: keep the ORIGINAL error visible
+            print(f"  (could not stop the simulation cleanly: {type(exc).__name__})")
 
     def _restore_barrel(self):
         sim = self.sim
@@ -844,6 +848,10 @@ class Robot:
         if simIK is None:
             self._build_builtin_ik()
             return
+        self._make_ik_group()
+
+    def _make_ik_group(self):
+        simIK = self.simIK
         self.ik_env = simIK.createEnvironment()
         self.ik_group = simIK.createGroup(self.ik_env)
         simIK.setGroupCalculation(self.ik_env, self.ik_group, simIK.method_damped_least_squares, 0.1, 99)
@@ -853,6 +861,17 @@ class Robot:
             constraints = (simIK.constraint_x | simIK.constraint_y | simIK.constraint_z
                            | simIK.constraint_alpha_beta | simIK.constraint_gamma)
         simIK.addElementFromScene(self.ik_env, self.ik_group, self.ur5, self.grab_ur5, self.ik_target, constraints)
+
+    def reset_ik(self):
+        """Throw the IK world away and rebuild it from the scene as it is NOW. Done after the barrel is glued on or let
+        go, and after every human stop, so the solver never works from a stale copy of the arm."""
+        if self.simIK is None or self.ik_env is None:
+            return
+        try:
+            self.simIK.eraseEnvironment(self.ik_env)
+        except Exception:
+            pass
+        self._make_ik_group()
 
     def _ik_to_builtin(self, pose):
         sim = self.sim
@@ -917,6 +936,7 @@ class Robot:
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, 0)
         sim.setObjectParent(self.barrel, self.grab_ur5, True)
         self.barrel_held = True
+        self.reset_ik()
         self.step(10)
         gap = vnorm(vsub(self.pos(self.grab_barrel), self.pos(self.grab_ur5)))
         return gap
@@ -927,6 +947,7 @@ class Robot:
         sim.setObjectParent(self.barrel, -1, True)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_respondable, self.barrel_respond0 or 1)
         sim.setObjectInt32Param(self.barrel, sim.shapeintparam_static, 0)
+        self.reset_ik()
         self.step(SETTLE_STEPS)
 
     # ---------- the two arm tasks ----------
@@ -1600,7 +1621,11 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as exc:
-        if type(exc).__name__ == "Again":                 # zmq.Again = our receive timeout
+        chain, e = [], exc
+        while e is not None:
+            chain.append(type(e).__name__)
+            e = e.__cause__ or e.__context__
+        if "Again" in chain:                              # zmq.Again = our receive timeout
             print(f"\nCoppeliaSim did not answer for {REPLY_TIMEOUT_S} s, so the script stopped instead of hanging.\n"
                   f"Look at the CoppeliaSim window: is a dialog box or error message open, is the simulation paused,\n"
                   f"or does the console at the bottom show a Lua error (for example from Bill's script)?")
